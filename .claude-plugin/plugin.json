@@ -1,0 +1,14 @@
+{
+  "name": "agent-chrome-wrapper",
+  "description": "Provides an MCP that gives agents access to Chrome, starting a separate Chrome instance for each session.",
+  "version": "0.0.2",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "mcpServers": {
+    "chrome-wrapper": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/chrome-wrapper.exe",
+      "args": []
+    }
+  }
+}
