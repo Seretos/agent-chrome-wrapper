@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log
+.vscode/
+.idea/
+
+# PyInstaller output — produced locally by scripts/build.ps1 and
+# shipped to end users via GitHub Releases, not the repo. Whole
+# bin/ tree so the Linux-side `bin/chrome-wrapper` (no extension) is
+# also covered, not just the Windows .exe.
+/bin/
+*.pyinstaller.tmp/

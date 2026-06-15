@@ -1,0 +1,330 @@
+name: release
+
+# Windows-only release pipeline (OS_TARGETS = [windows]).
+#
+# This plugin launches and manages local Chrome instances and is intended to
+# pair with agent-vdesktop on a Windows host, so it ships a Windows binary
+# only — no Linux matrix row, no Linux-binary assembly steps.
+#
+# Shape: Stamp -> Build (windows) -> Assembly.
+#   1. stamp:   one-shot Linux runner stamps version into pyproject.toml +
+#               both plugin manifests and uploads them as an artifact so the
+#               build job pulls the same stamped sources.
+#   2. build:   matrix job (windows only). Runs scripts/build.ps1
+#               (cross-platform pwsh) and uploads its bin/ tree as an
+#               OS-tagged artifact.
+#   3. assemble: Linux runner downloads the windows bin, builds the staging
+#               tree + release zip, force-pushes the orphan `release` branch,
+#               creates the GitHub Release, and dispatches to the marketplace.
+#
+# Both manifests use `command: .../bin/chrome-wrapper.exe`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (semver, no leading v) e.g. 0.0.1"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1. Stamp version + share the stamped source tree.
+  # ------------------------------------------------------------------
+  stamp:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      plugin_name: ${{ steps.meta.outputs.plugin_name }}
+      tag:         ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Validate version is semver
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '$V' is not valid semver (expected MAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if tag already exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          if gh api "repos/${{ github.repository }}/git/refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Delete it first or pick a new version."
+            exit 1
+          fi
+
+      - name: Stamp version into pyproject.toml + plugin manifests
+        shell: bash
+        run: |
+          V="${{ inputs.version }}"
+          # pyproject.toml — first `version = "..."` line wins.
+          sed -i -E "0,/^version[[:space:]]*=[[:space:]]*\"[^\"]*\"/s//version = \"$V\"/" pyproject.toml
+          # Both plugin manifests (Claude + Codex) get the same version.
+          for manifest in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            tmp=$(mktemp)
+            jq --arg v "$V" '.version = $v' "$manifest" > "$tmp"
+            mv "$tmp" "$manifest"
+          done
+          echo "Stamped version $V"
+          grep '^version' pyproject.toml
+          grep '"version"' .claude-plugin/plugin.json
+          grep '"version"' .codex-plugin/plugin.json
+
+      - name: Export plugin metadata
+        id: meta
+        shell: bash
+        run: |
+          PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
+          TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          echo "plugin_name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"                 >> "$GITHUB_OUTPUT"
+
+      - name: Upload stamped source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: stamped-source
+          # v4 excludes dotfiles/dotdirs by default; downstream jobs need
+          # .claude-plugin/ + .codex-plugin/ (and .github/, .gitattributes etc.)
+          # in the downloaded tree to build and assemble the release.
+          include-hidden-files: true
+          path: |
+            .
+            !.git
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # 2. Build — Windows binary, uploaded as an artifact.
+  # ------------------------------------------------------------------
+  build:
+    needs: stamp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Download stamped source
+        uses: actions/download-artifact@v4
+        with:
+          name: stamped-source
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Build binary + stage payload (${{ matrix.target }})
+        shell: pwsh
+        run: ./scripts/build.ps1 -Clean -Package
+
+      - name: Upload OS-tagged bin payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: bin/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ------------------------------------------------------------------
+  # 3. Assembly — stage the windows binary, push release branch, publish.
+  # ------------------------------------------------------------------
+  assemble:
+    needs: [stamp, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history for orphan branch push)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download stamped source
+        uses: actions/download-artifact@v4
+        with:
+          name: stamped-source
+          path: stamped/
+
+      - name: Download all per-OS bins
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins/
+          merge-multiple: false
+
+      - name: Build merged staging tree
+        id: stage
+        shell: bash
+        run: |
+          STAGE="build/stage/agent-chrome-wrapper"
+          mkdir -p "$STAGE"
+
+          # Copy the install-ready, non-binary parts from the stamped tree.
+          cp -a stamped/.claude-plugin "$STAGE/"
+          [ -d stamped/.codex-plugin ] && cp -a stamped/.codex-plugin "$STAGE/" || true
+          [ -f stamped/README.md ] && cp -a stamped/README.md "$STAGE/" || true
+          [ -f stamped/LICENSE   ] && cp -a stamped/LICENSE   "$STAGE/" || true
+          if [ -d stamped/skills ]; then
+            cp -a stamped/skills "$STAGE/"
+          fi
+          # assets/ goes onto the orphan release branch alongside the binaries,
+          # so the dispatch payload's icon URL
+          # (raw.githubusercontent.com/${repo}/${TAG}/assets/icon.png) resolves.
+          [ -d stamped/assets ] && cp -a stamped/assets "$STAGE/" || true
+          # description.md ships onto the orphan release branch too, so the
+          # dispatch payload's description_url
+          # (raw.githubusercontent.com/${repo}/${TAG}/description.md) resolves.
+          [ -f stamped/description.md ] && cp -a stamped/description.md "$STAGE/" || true
+
+          # Merge the per-OS bin payload. The build job uploads to
+          # bins/bin-windows/ which contains chrome-wrapper.exe.
+          mkdir -p "$STAGE/bin"
+          shopt -s nullglob
+          for d in bins/bin-*/; do
+            echo "Merging $d -> $STAGE/bin/"
+            cp -a "$d"/* "$STAGE/bin/"
+          done
+
+          echo "=== merged bin/ ==="
+          ls -la "$STAGE/bin"
+
+          # Windows-only: assert the .exe got picked up.
+          if [ ! -f "$STAGE/bin/chrome-wrapper.exe" ]; then
+            echo "::error::missing Windows binary in merged stage"; exit 1
+          fi
+
+          ZIP="dist/agent-chrome-wrapper-${{ inputs.version }}.zip"
+          mkdir -p dist
+          # Use Python's zipfile so we can stamp Unix mode bits into the
+          # central directory.
+          python3 - "$STAGE" "$ZIP" <<'PY'
+          import os, sys, time, zipfile
+          stage, zip_path = sys.argv[1], sys.argv[2]
+          EXECS = {"bin/chrome-wrapper.exe"}
+          EXE_ATTR = (0o755 << 16) | 0x8000  # S_IFREG | 0755
+          REG_ATTR = (0o644 << 16) | 0x8000
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+              for dirpath, dirnames, filenames in os.walk(stage):
+                  dirnames.sort()
+                  for name in sorted(filenames):
+                      abs_path = os.path.join(dirpath, name)
+                      rel = os.path.relpath(abs_path, stage).replace(os.sep, "/")
+                      st = os.stat(abs_path)
+                      mtime = time.localtime(st.st_mtime)[:6]
+                      zi = zipfile.ZipInfo(filename=rel, date_time=mtime)
+                      zi.compress_type = zipfile.ZIP_DEFLATED
+                      zi.create_system = 3  # Unix
+                      zi.external_attr = EXE_ATTR if rel in EXECS else REG_ATTR
+                      with open(abs_path, "rb") as fh:
+                          zf.writestr(zi, fh.read())
+          print(f"wrote {zip_path} ({os.path.getsize(zip_path)} bytes)")
+          PY
+
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          echo "asset=$ZIP"   >> "$GITHUB_OUTPUT"
+
+      - name: Push orphan release branch and capture commit
+        id: rel
+        shell: bash
+        run: |
+          STAGE="${{ steps.stage.outputs.stage }}"
+          ZIP="${{ steps.stage.outputs.asset }}"
+
+          # Stash staging + zip outside the worktree before `checkout --orphan`
+          # wipes everything.
+          TMP=$(mktemp -d)
+          cp -a "$STAGE"/. "$TMP/"
+          ASSET_DIR=$(mktemp -d)
+          cp "$ZIP" "$ASSET_DIR/"
+          echo "asset=$ASSET_DIR/$(basename "$ZIP")" >> "$GITHUB_OUTPUT"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout --orphan release
+          git rm -rf . > /dev/null 2>&1 || true
+          git clean -fdx > /dev/null 2>&1 || true
+
+          leftover=$(find . -mindepth 1 -maxdepth 1 -not -name '.git' || true)
+          if [ -n "$leftover" ]; then
+            echo "::error::working tree not empty after clean:"; echo "$leftover"; exit 1
+          fi
+
+          cp -a "$TMP"/. .
+
+          echo "=== release branch contents ==="
+          find . -mindepth 1 -not -path './.git*' | sort
+
+          git add bin/chrome-wrapper.exe
+          git update-index --chmod=+x bin/chrome-wrapper.exe
+          git add -A
+          git commit -m "release: v${{ inputs.version }}"
+          git push origin release --force
+
+          SHA=$(git rev-parse HEAD)
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.stamp.outputs.tag }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ steps.rel.outputs.sha }}" \
+            --title "$TAG" \
+            --generate-notes \
+            ${{ contains(inputs.version, '-') && '--prerelease' || '' }} \
+            "${{ steps.rel.outputs.asset }}"
+
+      # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
+      # (Actions blocks this to prevent recursive loops). Call the marketplace
+      # directly with a separate PAT.
+      - name: Dispatch to agent-marketplace
+        shell: bash
+        env:
+          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          NAME:    ${{ needs.stamp.outputs.plugin_name }}
+          TAG:     ${{ needs.stamp.outputs.tag }}
+        run: |
+          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            -d @- <<EOF
+          {
+            "event_type": "plugin-release",
+            "client_payload": {
+              "name":        "${NAME}",
+              "description": "${DESC}",
+              "repo":        "${{ github.repository }}",
+              "category":    "mcp",
+              "version":     "${VERSION}",
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
+              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
+            }
+          }
+          EOF

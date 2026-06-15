@@ -1,0 +1,46 @@
+name: tests
+
+# Runs pytest on every push to any branch and on every PR. Distinct from
+# release.yml, which is workflow_dispatch-driven and produces the OS-specific
+# binaries / release zip.
+#
+# This plugin is Windows-only (it launches and manages local Chrome instances
+# and is intended to pair with agent-vdesktop on a Windows host), so the test
+# matrix runs Windows-only.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install plugin + test deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Run pytest
+        shell: bash
+        run: python -m pytest

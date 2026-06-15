@@ -1,0 +1,83 @@
+name: dispatch-to-marketplace
+
+# Manual recovery tool. The normal release flow (release.yml) dispatches to
+# the marketplace itself. Use this only when:
+#   - The marketplace dispatch step in release.yml failed and you want to
+#     retry without re-running the whole build.
+#   - You need to re-publish an existing release to the marketplace (e.g.
+#     after the marketplace.json schema changed).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to dispatch (e.g. agent-chrome-wrapper--v0.0.1)"
+        required: true
+        type: string
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag }}"
+          # Tag format: <plugin-name>--v<version>. Strip everything up to and including "--v".
+          VERSION="${TAG##*--v}"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release branch
+        uses: actions/checkout@v4
+        with:
+          ref: release
+
+      - name: Verify plugin.json version matches tag
+        shell: bash
+        run: |
+          PJ_VERSION=$(jq -r '.version' .claude-plugin/plugin.json)
+          TAG_VERSION="${{ steps.tag.outputs.version }}"
+          if [ "$PJ_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::plugin.json on release branch is v$PJ_VERSION, but you asked to dispatch v$TAG_VERSION."
+            echo "Re-run release.yml with version=$TAG_VERSION (or re-check the release branch state)."
+            exit 1
+          fi
+
+      - name: Read plugin metadata from plugin.json
+        id: meta
+        shell: bash
+        run: |
+          DESC=$(jq -r '.description' .claude-plugin/plugin.json)
+          NAME=$(jq -r '.name'        .claude-plugin/plugin.json)
+          echo "description=${DESC}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}"        >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch to agent-marketplace
+        env:
+          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          NAME:    ${{ steps.meta.outputs.name }}
+          DESC:    ${{ steps.meta.outputs.description }}
+          VERSION: ${{ steps.tag.outputs.version }}
+          TAG:     ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
+            -d @- <<EOF
+          {
+            "event_type": "plugin-release",
+            "client_payload": {
+              "name":        "${NAME}",
+              "description": "${DESC}",
+              "repo":        "${{ github.repository }}",
+              "category":    "mcp",
+              "version":     "${VERSION}",
+              "ref":         "${TAG}",
+              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
+              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
+            }
+          }
+          EOF
