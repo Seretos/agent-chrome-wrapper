@@ -40,6 +40,7 @@ jobs:
     outputs:
       plugin_name: ${{ steps.meta.outputs.plugin_name }}
       tag:         ${{ steps.meta.outputs.tag }}
+      description:  ${{ steps.meta.outputs.description }}
     steps:
       - name: Validate version is semver
         shell: bash
@@ -90,8 +91,14 @@ jobs:
         run: |
           PLUGIN_NAME=$(jq -r '.name' .claude-plugin/plugin.json)
           TAG="${PLUGIN_NAME}--v${{ inputs.version }}"
+          # Capture the description here, from the canonical manifest, so the
+          # assemble job's dispatch step doesn't have to read it back from the
+          # stamped/ tree — that directory is wiped by `git clean -fdx` in the
+          # orphan-release-branch step before dispatch runs.
+          DESCRIPTION=$(jq -r '.description' .claude-plugin/plugin.json)
           echo "plugin_name=${PLUGIN_NAME}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}"                 >> "$GITHUB_OUTPUT"
+          echo "description=${DESCRIPTION}" >> "$GITHUB_OUTPUT"
 
       - name: Upload stamped source tree
         uses: actions/upload-artifact@v4
@@ -307,8 +314,11 @@ jobs:
           VERSION: ${{ inputs.version }}
           NAME:    ${{ needs.stamp.outputs.plugin_name }}
           TAG:     ${{ needs.stamp.outputs.tag }}
+          DESC:    ${{ needs.stamp.outputs.description }}
         run: |
-          DESC=$(jq -r '.description' stamped/.claude-plugin/plugin.json)
+          # DESC comes from the stamp job's output (env above); the stamped/
+          # tree it used to be read from no longer exists at this point —
+          # `git clean -fdx` in the release-branch step removed it.
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
