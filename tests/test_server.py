@@ -18,7 +18,7 @@ import pytest
 import chrome_wrapper_plugin.server as server_module
 import chrome_wrapper_plugin.state as state_module
 from chrome_wrapper_plugin.cdp import CDPSession
-from chrome_wrapper_plugin.server import ChromeEngine, _get_engine, get_instance_info, ping
+from chrome_wrapper_plugin.server import ChromeEngine, _get_engine, get_instance_info
 from chrome_wrapper_plugin.state import SessionState
 
 
@@ -33,12 +33,6 @@ def _fake_engine(**overrides) -> ChromeEngine:
     )
     defaults.update(overrides)
     return ChromeEngine(**defaults)
-
-
-# ── ping ──────────────────────────────────────────────────────────────────────
-
-def test_ping_still_works():
-    assert ping() == "pong"
 
 
 # ── get_instance_info ─────────────────────────────────────────────────────────

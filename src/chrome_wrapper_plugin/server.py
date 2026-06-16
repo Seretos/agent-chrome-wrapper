@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import base64
 import dataclasses
 import datetime
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 
 from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.chrome_process import (
@@ -109,9 +111,134 @@ def _get_engine() -> ChromeEngine:
 
 
 @mcp.tool()
-def ping() -> str:
-    """Health check tool. Replace with real tools as you build them out."""
-    return "pong"
+def navigate(url: str, wait_until: str = "load") -> dict:
+    """Navigate the current Chrome page to *url* and wait for it to load.
+
+    Parameters
+    ----------
+    url:
+        The URL to navigate to.
+    wait_until:
+        Wait condition.  Only ``"load"`` is supported for MVP; any other value
+        raises ``ValueError``.
+
+    Returns
+    -------
+    dict
+        The raw ``Page.navigate`` CDP result dict (contains ``frameId``,
+        ``loaderId``, and optionally ``errorText``).
+    """
+    if wait_until != "load":
+        raise ValueError(
+            f"wait_until={wait_until!r} is not supported; only 'load' is valid for MVP"
+        )
+
+    engine = _get_engine()
+    session = engine.session
+
+    load_event = threading.Event()
+
+    def _on_load(params: dict) -> None:  # noqa: ARG001
+        load_event.set()
+
+    session.add_listener("Page.loadEventFired", _on_load)
+    try:
+        result = session.send("Page.navigate", {"url": url})
+        fired = load_event.wait(timeout=30.0)
+        if not fired:
+            raise TimeoutError(
+                f"Page.loadEventFired not received within 30s after navigating to {url!r}"
+            )
+        return result
+    finally:
+        session.remove_listener("Page.loadEventFired", _on_load)
+
+
+@mcp.tool()
+def get_page_info() -> dict:
+    """Return URL and title of the page currently loaded in Chrome.
+
+    Returns
+    -------
+    dict
+        A dict with at least ``url`` and ``title`` keys, sourced from
+        ``Target.getTargetInfo``.
+    """
+    engine = _get_engine()
+    result = engine.session.send("Target.getTargetInfo", {})
+    target_info = result["targetInfo"]
+    return {
+        "url": target_info["url"],
+        "title": target_info["title"],
+    }
+
+
+@mcp.tool()
+def screenshot(full_page: bool = False) -> Image:
+    """Capture a PNG screenshot of the current Chrome viewport.
+
+    Parameters
+    ----------
+    full_page:
+        Accepted for API consistency but ignored for MVP — only the
+        viewport is captured.
+
+    Returns
+    -------
+    Image
+        A FastMCP ``Image`` object containing the PNG bytes.
+    """
+    # TODO(#3): wire captureBeyondViewport when full_page is True
+    engine = _get_engine()
+    result = engine.session.send("Page.captureScreenshot", {"format": "png"})
+    png_bytes = base64.b64decode(result["data"])
+    return Image(data=png_bytes, format="png")
+
+
+@mcp.tool()
+def evaluate_js(expression: str) -> dict:
+    """Evaluate *expression* in the page's JavaScript context and return the result.
+
+    Parameters
+    ----------
+    expression:
+        A JavaScript expression or statement to evaluate.  Promises are
+        awaited automatically.
+
+    Returns
+    -------
+    dict
+        The raw ``Runtime.evaluate`` CDP result dict (contains a ``result``
+        sub-dict with ``type``, ``value``, etc.).
+    """
+    engine = _get_engine()
+    return engine.session.send(
+        "Runtime.evaluate",
+        {"expression": expression, "awaitPromise": True, "returnByValue": True},
+    )
+
+
+@mcp.tool()
+def cdp(method: str, params: dict) -> dict:
+    """Send a raw CDP command and return its result dict.
+
+    This is the architectural completeness guarantee — use it whenever a
+    high-level tool is missing.  The agent is never blocked.
+
+    Parameters
+    ----------
+    method:
+        CDP method, e.g. ``"DOM.getDocument"``.
+    params:
+        Parameters dict to pass to the CDP method.
+
+    Returns
+    -------
+    dict
+        The raw CDP result dict.
+    """
+    engine = _get_engine()
+    return engine.session.send(method, params)
 
 
 @mcp.tool()
