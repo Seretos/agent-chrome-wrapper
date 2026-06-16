@@ -41,23 +41,34 @@ def test_get_instance_info_keys():
     """get_instance_info returns a dict with all expected keys."""
     engine = _fake_engine()
 
-    with mock.patch.object(server_module, "_get_engine", return_value=engine):
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
         info = get_instance_info()
 
-    assert set(info.keys()) == {"session_id", "pid", "port", "user_data_dir", "hwnd"}
+    assert set(info.keys()) == {
+        "session_id", "pid", "port", "user_data_dir", "profile", "hwnd", "window_title"
+    }
 
 
 def test_get_instance_info_values_no_proc():
     """When proc is None (reattach case), pid in result is None."""
     engine = _fake_engine(proc=None, port=9333, session_id="sess-42")
 
-    with mock.patch.object(server_module, "_get_engine", return_value=engine):
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
         info = get_instance_info()
 
     assert info["pid"] is None
     assert info["port"] == 9333
     assert info["session_id"] == "sess-42"
     assert info["hwnd"] is None
+    assert info["window_title"] is None
 
 
 def test_get_instance_info_values_with_proc():
@@ -66,10 +77,86 @@ def test_get_instance_info_values_with_proc():
     proc.pid = 42000
     engine = _fake_engine(proc=proc, port=9444, session_id="sess-99")
 
-    with mock.patch.object(server_module, "_get_engine", return_value=engine):
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
         info = get_instance_info()
 
     assert info["pid"] == 42000
+
+
+def test_get_instance_info_hwnd_resolved():
+    """When proc.pid is available, find_chrome_hwnd is called with it and hwnd/title forwarded."""
+    proc = mock.MagicMock(spec=subprocess.Popen)
+    proc.pid = 42000
+    engine = _fake_engine(proc=proc, port=9444, session_id="sess-99")
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(
+            server_module, "find_chrome_hwnd", return_value=(0x001A0042, "Google Chrome")
+        ) as mock_hwnd,
+    ):
+        info = get_instance_info()
+
+    mock_hwnd.assert_called_once_with(42000)
+    assert info["hwnd"] == 0x001A0042
+    assert info["window_title"] == "Google Chrome"
+
+
+def test_get_instance_info_reattach_uses_saved_pid():
+    """On the reattach path (proc=None), find_chrome_hwnd is called with the pid from saved state."""
+    engine = _fake_engine(proc=None, port=9333, session_id="sess-42")
+    saved = _make_session_state(pid=55555, session_id="sess-42")
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=saved),
+        mock.patch.object(
+            server_module, "find_chrome_hwnd", return_value=(None, None)
+        ) as mock_hwnd,
+    ):
+        get_instance_info()
+
+    mock_hwnd.assert_called_once_with(55555)
+
+
+def test_get_instance_info_profile_from_saved_state():
+    """profile field in result comes from saved SessionState.profile."""
+    engine = _fake_engine(proc=None, port=9333, session_id="sess-42")
+    saved = _make_session_state(pid=55555, session_id="sess-42", profile="/tmp/master")
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=saved),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["profile"] == "/tmp/master"
+
+
+def test_get_instance_info_no_saved_state_profile_is_none():
+    """When load_state returns None, profile/hwnd/window_title are all None and
+    find_chrome_hwnd is not called (no pid to look up)."""
+    engine = _fake_engine(proc=None, port=9333, session_id="sess-42")
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(
+            server_module, "find_chrome_hwnd", return_value=(None, None)
+        ) as mock_hwnd,
+    ):
+        info = get_instance_info()
+
+    mock_hwnd.assert_not_called()
+    assert info["profile"] is None
+    assert info["hwnd"] is None
+    assert info["window_title"] is None
 
 
 # ── _get_engine lifecycle ─────────────────────────────────────────────────────

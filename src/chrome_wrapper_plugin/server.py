@@ -17,6 +17,7 @@ from chrome_wrapper_plugin.chrome_process import (
     launch_chrome,
     wait_for_cdp,
 )
+from chrome_wrapper_plugin.hwnd import find_chrome_hwnd
 from chrome_wrapper_plugin.profiles import master_profile_dir, seed_profile
 from chrome_wrapper_plugin.state import (
     SessionState,
@@ -247,21 +248,44 @@ def get_instance_info() -> dict:
 
     Triggers a lazy Chrome launch if none is running yet.
 
-    Keys:
-    - ``session_id``: stable ID for this MCP session.
-    - ``pid``: Chrome process PID (None when reattached without a Popen handle).
-    - ``port``: CDP remote-debugging port.
-    - ``user_data_dir``: path to the ephemeral user-data directory.
-    - ``hwnd``: Chrome top-level window handle — deferred to ticket #5.
+    Keys
+    ----
+    session_id : str
+        Stable ID for this MCP session.
+    pid : int | None
+        Chrome process PID; None when reattached without a Popen handle.
+    port : int
+        CDP remote-debugging port.
+    user_data_dir : str
+        Path to the ephemeral user-data directory.
+    profile : str | None
+        Master profile path used to seed this session; None if unavailable.
+    hwnd : int | None
+        Chrome top-level window handle (HWND).  Pass to vdesktop.adopt_window(hwnd).
+        None on non-Windows or when the window is not yet visible.
+    window_title : str | None
+        Title of the Chrome browser-frame window, or None when hwnd is None.
     """
     engine = _get_engine()
     pid = engine.proc.pid if engine.proc is not None else None
+
+    saved = load_state(engine.session_id)
+    profile = saved.profile if saved is not None else None
+    # On the reattach path (proc is None), recover pid from saved state for HWND lookup
+    lookup_pid = pid if pid is not None else (saved.pid if saved is not None else None)
+
+    hwnd, window_title = (
+        find_chrome_hwnd(lookup_pid) if lookup_pid is not None else (None, None)
+    )
+
     return {
         "session_id": engine.session_id,
         "pid": pid,
         "port": engine.port,
         "user_data_dir": str(engine.user_data_dir),
-        "hwnd": None,  # populated in ticket #5
+        "profile": profile,
+        "hwnd": hwnd,
+        "window_title": window_title,
     }
 
 
