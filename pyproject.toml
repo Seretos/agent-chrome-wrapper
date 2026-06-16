@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
   "mcp>=1.2",
+  "websocket-client>=1.7",
 ]
 
 [project.optional-dependencies]

@@ -9,6 +9,7 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
+from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.chrome_process import (
     find_free_port,
     launch_chrome,
@@ -38,6 +39,7 @@ class ChromeEngine:
     port: int
     user_data_dir: Path
     session_id: str
+    session: Optional[CDPSession] = dataclasses.field(default=None)
 
 
 _engine: Optional[ChromeEngine] = None
@@ -57,12 +59,18 @@ def _get_engine() -> ChromeEngine:
     # Try to reattach to an already-running Chrome (crash-recovery path)
     state = load_state(session_id)
     if state is not None and is_process_alive(state.pid):
-        _engine = ChromeEngine(
+        # wait_for_cdp guards against a Chrome that is alive-by-PID but not
+        # yet accepting CDP connections (e.g. still starting up after a crash).
+        wait_for_cdp(state.port)
+        engine = ChromeEngine(
             proc=None,
             port=state.port,
             user_data_dir=Path(state.user_data_dir),
             session_id=session_id,
         )
+        engine.session = CDPSession(port=state.port)
+        engine.session.connect()   # raises → _engine stays None (no cache poison)
+        _engine = engine
         return _engine
 
     # Fresh launch
@@ -88,12 +96,15 @@ def _get_engine() -> ChromeEngine:
         )
     )
 
-    _engine = ChromeEngine(
+    engine = ChromeEngine(
         proc=proc,
         port=port,
         user_data_dir=user_data_dir,
         session_id=session_id,
     )
+    engine.session = CDPSession(port=port)
+    engine.session.connect()   # raises → _engine stays None (no cache poison)
+    _engine = engine
     return _engine
 
 

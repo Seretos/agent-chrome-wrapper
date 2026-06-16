@@ -17,6 +17,7 @@ import pytest
 
 import chrome_wrapper_plugin.server as server_module
 import chrome_wrapper_plugin.state as state_module
+from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.server import ChromeEngine, _get_engine, get_instance_info, ping
 from chrome_wrapper_plugin.state import SessionState
 
@@ -114,9 +115,12 @@ class TestGetEngineReattach:
             mock.patch(
                 "chrome_wrapper_plugin.server.is_process_alive", return_value=True
             ),
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
             mock.patch(
                 "chrome_wrapper_plugin.server.launch_chrome"
             ) as mock_launch,
+            mock.patch.object(CDPSession, "__init__", return_value=None),
+            mock.patch.object(CDPSession, "connect", return_value=None),
         ):
             engine = _get_engine()
 
@@ -169,6 +173,8 @@ class TestGetEngineFreshLaunch:
             mock.patch(
                 "tempfile.mkdtemp", return_value=str(tmp_path / "udd")
             ),
+            mock.patch.object(CDPSession, "__init__", return_value=None),
+            mock.patch.object(CDPSession, "connect", return_value=None),
         ):
             engine = _get_engine()
 
@@ -204,3 +210,152 @@ class TestGetEngineCache:
 
     def teardown_method(self):
         server_module._engine = None
+
+
+# ── TestGetEngineAttachesSession ──────────────────────────────────────────────
+#
+# Verifies that _get_engine() always attaches a connected CDPSession, on both
+# the reattach path and the fresh-launch path.
+
+class TestGetEngineAttachesSession:
+    """_get_engine() attaches a connected CDPSession on both lifecycle paths."""
+
+    def setup_method(self):
+        server_module._engine = None
+
+    def teardown_method(self):
+        server_module._engine = None
+
+    def test_reattach_path_attaches_session(self, monkeypatch):
+        """Reattach path: engine.session is a CDPSession and connect() called once."""
+        live_state = _make_session_state(port=9300)
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.load_state", return_value=live_state
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.is_process_alive", return_value=True
+            ),
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
+            mock.patch("chrome_wrapper_plugin.server.launch_chrome"),
+            mock.patch.object(CDPSession, "__init__", return_value=None) as mock_init,
+            mock.patch.object(CDPSession, "connect", return_value=None) as mock_connect,
+        ):
+            engine = _get_engine()
+
+        assert isinstance(engine.session, CDPSession)
+        mock_connect.assert_called_once()
+
+    def test_fresh_launch_path_attaches_session(self, monkeypatch, tmp_path):
+        """Fresh-launch path: engine.session is a CDPSession and connect() called once."""
+        dead_state = _make_session_state(pid=99999, port=9301)
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
+
+        fake_proc = mock.MagicMock(spec=subprocess.Popen)
+        fake_proc.pid = 12345
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.load_state", return_value=dead_state
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.is_process_alive", return_value=False
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.find_free_port", return_value=9400
+            ),
+            mock.patch("chrome_wrapper_plugin.server.seed_profile"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.launch_chrome", return_value=fake_proc
+            ),
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
+            mock.patch("chrome_wrapper_plugin.server.save_state"),
+            mock.patch("tempfile.mkdtemp", return_value=str(tmp_path / "udd")),
+            mock.patch.object(CDPSession, "__init__", return_value=None) as mock_init,
+            mock.patch.object(CDPSession, "connect", return_value=None) as mock_connect,
+        ):
+            engine = _get_engine()
+
+        assert isinstance(engine.session, CDPSession)
+        mock_connect.assert_called_once()
+
+
+# ── TestGetEnginePoisonedCache ────────────────────────────────────────────────
+#
+# Guards blocking-1: if CDPSession.connect() raises, _engine must stay None so
+# the next call to _get_engine() retries rather than returning a broken engine.
+
+class TestGetEnginePoisonedCache:
+    """connect() failure must NOT cache a broken engine."""
+
+    def setup_method(self):
+        server_module._engine = None
+
+    def teardown_method(self):
+        server_module._engine = None
+
+    def test_reattach_connect_failure_leaves_engine_none(self, monkeypatch):
+        """Reattach path: connect() raises → _engine stays None."""
+        live_state = _make_session_state(port=9300)
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.load_state", return_value=live_state
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.is_process_alive", return_value=True
+            ),
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
+            mock.patch.object(CDPSession, "__init__", return_value=None),
+            mock.patch.object(
+                CDPSession, "connect", side_effect=RuntimeError("CDP handshake failed")
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="CDP handshake failed"):
+                _get_engine()
+
+        assert server_module._engine is None
+
+    def test_fresh_launch_connect_failure_leaves_engine_none(
+        self, monkeypatch, tmp_path
+    ):
+        """Fresh-launch path: connect() raises → _engine stays None."""
+        dead_state = _make_session_state(pid=99999, port=9301)
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
+
+        fake_proc = mock.MagicMock(spec=subprocess.Popen)
+        fake_proc.pid = 12345
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.load_state", return_value=dead_state
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.is_process_alive", return_value=False
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.find_free_port", return_value=9400
+            ),
+            mock.patch("chrome_wrapper_plugin.server.seed_profile"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.launch_chrome", return_value=fake_proc
+            ),
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
+            mock.patch("chrome_wrapper_plugin.server.save_state"),
+            mock.patch("tempfile.mkdtemp", return_value=str(tmp_path / "udd")),
+            mock.patch.object(CDPSession, "__init__", return_value=None),
+            mock.patch.object(
+                CDPSession, "connect", side_effect=RuntimeError("CDP handshake failed")
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="CDP handshake failed"):
+                _get_engine()
+
+        assert server_module._engine is None
