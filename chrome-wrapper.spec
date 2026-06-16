@@ -33,6 +33,7 @@ extra_hidden = [
     "starlette",
 ]
 extra_hidden += collect_submodules("chrome_wrapper_plugin")
+extra_hidden += collect_submodules("websocket")
 
 a = Analysis(
     ["src/chrome_wrapper_plugin/__main__.py"],
