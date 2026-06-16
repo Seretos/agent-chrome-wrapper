@@ -6,6 +6,7 @@ import datetime
 import subprocess
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -15,23 +16,39 @@ from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.chrome_process import (
     find_free_port,
     launch_chrome,
+    terminate_chrome,
     wait_for_cdp,
 )
 from chrome_wrapper_plugin.hwnd import find_chrome_hwnd
 from chrome_wrapper_plugin.profiles import master_profile_dir, seed_profile
 from chrome_wrapper_plugin.state import (
     SessionState,
+    delete_state,
     is_process_alive,
     load_state,
     reap_orphans,
     resolve_session_id,
     save_state,
 )
-# TODO(#5): import delete_state + terminate_chrome and wire them into
-# shutdown/lifespan teardown so ephemeral user-data-dirs are cleaned up
-# and the session state file is removed on clean exit.
 
-mcp = FastMCP("chrome-wrapper")
+@asynccontextmanager
+async def _lifespan(server):  # noqa: ARG001
+    """Clean up Chrome and session state on MCP server shutdown."""
+    yield
+    # Teardown runs after the yield — mirrors FastMCP's lifespan contract.
+    global _engine
+    if _engine is not None:
+        engine = _engine
+        _engine = None  # clear before teardown so a racing call sees None
+        try:
+            engine.session.close()
+        except Exception:
+            pass
+        terminate_chrome(engine.proc, engine.user_data_dir)
+        delete_state(engine.session_id)
+
+
+mcp = FastMCP("chrome-wrapper", lifespan=_lifespan)
 
 
 @dataclasses.dataclass
