@@ -35,11 +35,26 @@ extra_hidden = [
 extra_hidden += collect_submodules("chrome_wrapper_plugin")
 extra_hidden += collect_submodules("websocket")
 
+# pywin32 ships native extension DLLs that PyInstaller misses without
+# explicit collection. collect_all("pywin32") is the preferred single-call
+# form; fall back to collect_all("win32api") which carries the shared DLL
+# set used by win32gui/win32process/win32con.
+import sys as _sys
+if _sys.platform == "win32":
+    from PyInstaller.utils.hooks import collect_all as _collect_all
+    try:
+        _pw32_datas, _pw32_bins, _pw32_hidden = _collect_all("pywin32")
+    except Exception:
+        _pw32_datas, _pw32_bins, _pw32_hidden = _collect_all("win32api")
+    extra_hidden += _pw32_hidden
+else:
+    _pw32_bins, _pw32_datas = [], []
+
 a = Analysis(
     ["src/chrome_wrapper_plugin/__main__.py"],
     pathex=[str(ROOT / "src")],
-    binaries=[],
-    datas=[],
+    binaries=_pw32_bins,
+    datas=_pw32_datas,
     hiddenimports=mcp_hiddenimports + extra_hidden,
     hookspath=[],
     hooksconfig={},
