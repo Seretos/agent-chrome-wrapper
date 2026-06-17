@@ -18,14 +18,21 @@ import chrome_wrapper_plugin.server as server_module
 from chrome_wrapper_plugin.server import (
     ChromeEngine,
     _attach_buffers,
+    _resolve_element_center,
     cdp,
+    click,
     evaluate_js,
+    fill,
     get_console_logs,
     get_network_log,
     get_page_info,
+    hover,
     navigate,
+    press_key,
     screenshot,
+    select_option,
 )
+from chrome_wrapper_plugin.server import type as type_text
 from mcp.server.fastmcp import Image
 
 
@@ -743,3 +750,382 @@ class TestAttachBuffersCallbacks:
 
         assert len(second) == 1
         assert second[0]["level"] == "error"
+
+
+# ── _resolve_element_center ───────────────────────────────────────────────────
+
+class TestResolveElementCenter:
+    """Tests for the _resolve_element_center() helper."""
+
+    def test_returns_coordinates_from_js_result(self):
+        """_resolve_element_center() must return (x, y) floats from the JS result."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": {"x": 100.0, "y": 200.0}}
+        }
+
+        result = _resolve_element_center(engine.session, "#btn")
+
+        assert result == (100.0, 200.0)
+
+    def test_raises_value_error_when_no_element(self):
+        """_resolve_element_center() must raise ValueError when JS returns null."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": None}}
+
+        with pytest.raises(ValueError, match="No element found"):
+            _resolve_element_center(engine.session, "#missing")
+
+    def test_raises_runtime_error_on_exception_details(self):
+        """_resolve_element_center() must raise RuntimeError when CDP returns exceptionDetails."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "exceptionDetails": {"text": "boom"},
+            "result": {},
+        }
+
+        with pytest.raises(RuntimeError):
+            _resolve_element_center(engine.session, "#bad")
+
+    def test_sends_runtime_evaluate_with_selector(self):
+        """_resolve_element_center() must call Runtime.evaluate with an expression containing the selector."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": {"x": 50.0, "y": 60.0}}
+        }
+
+        _resolve_element_center(engine.session, "#my-btn")
+
+        call_args = engine.session.send.call_args
+        assert call_args[0][0] == "Runtime.evaluate"
+        assert "#my-btn" in call_args[0][1]["expression"]
+
+
+# ── click ─────────────────────────────────────────────────────────────────────
+
+class TestClick:
+    """Tests for the click() tool."""
+
+    def test_click_resolves_and_dispatches_three_mouse_events(self):
+        """click() must dispatch mouseMoved, mousePressed, mouseReleased."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(50.0, 75.0)):
+            click("#btn")
+
+        calls = engine.session.send.call_args_list
+        assert len(calls) == 3
+        event_types = [c[0][1]["type"] for c in calls]
+        assert event_types == ["mouseMoved", "mousePressed", "mouseReleased"]
+
+    def test_click_returns_coordinates(self):
+        """click() must return {"x": float, "y": float}."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(50.0, 75.0)):
+            result = click("#btn")
+
+        assert result == {"x": 50.0, "y": 75.0}
+
+    def test_click_button_left_on_press_and_release(self):
+        """click() must use button='left' for mousePressed/mouseReleased and button='none' for mouseMoved."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(50.0, 75.0)):
+            click("#btn")
+
+        calls = engine.session.send.call_args_list
+        move_params = calls[0][0][1]
+        press_params = calls[1][0][1]
+        release_params = calls[2][0][1]
+        assert move_params["button"] == "none"
+        assert press_params["button"] == "left"
+        assert release_params["button"] == "left"
+
+    def test_click_raises_value_error_when_selector_not_found(self):
+        """click() must propagate ValueError from _resolve_element_center."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", side_effect=ValueError("No element found")):
+            with pytest.raises(ValueError, match="No element found"):
+                click("#missing")
+
+
+# ── hover ─────────────────────────────────────────────────────────────────────
+
+class TestHover:
+    """Tests for the hover() tool."""
+
+    def test_hover_dispatches_mouse_moved_only(self):
+        """hover() must dispatch exactly one Input.dispatchMouseEvent with type=mouseMoved."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(30.0, 40.0)):
+            hover("#link")
+
+        calls = engine.session.send.call_args_list
+        assert len(calls) == 1
+        assert calls[0][0][0] == "Input.dispatchMouseEvent"
+        assert calls[0][0][1]["type"] == "mouseMoved"
+
+    def test_hover_returns_coordinates(self):
+        """hover() must return {"x": float, "y": float}."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(30.0, 40.0)):
+            result = hover("#link")
+
+        assert result == {"x": 30.0, "y": 40.0}
+
+    def test_hover_raises_value_error_when_selector_not_found(self):
+        """hover() must propagate ValueError from _resolve_element_center."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", side_effect=ValueError("No element found")):
+            with pytest.raises(ValueError, match="No element found"):
+                hover("#missing")
+
+
+# ── type ──────────────────────────────────────────────────────────────────────
+
+class TestType:
+    """Tests for the type() tool (imported as type_text)."""
+
+    def test_type_clicks_then_dispatches_key_events(self):
+        """type() with 'ab' must send 3 mouse events then 4 key events (keyDown+keyUp per char)."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(10.0, 20.0)):
+            type_text("#input", "ab")
+
+        calls = engine.session.send.call_args_list
+        # 3 mouse events + 2 chars * 2 key events = 7 total
+        assert len(calls) == 7
+        mouse_calls = [c for c in calls if c[0][0] == "Input.dispatchMouseEvent"]
+        key_calls = [c for c in calls if c[0][0] == "Input.dispatchKeyEvent"]
+        assert len(mouse_calls) == 3
+        assert len(key_calls) == 4
+
+    def test_type_key_events_carry_text_and_unmodified_text(self):
+        """type() key events must have text and unmodifiedText set to the character."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(10.0, 20.0)):
+            type_text("#input", "a")
+
+        key_calls = [c for c in engine.session.send.call_args_list
+                     if c[0][0] == "Input.dispatchKeyEvent"]
+        assert len(key_calls) == 2
+        for call in key_calls:
+            params = call[0][1]
+            assert params["text"] == "a"
+            assert params["unmodifiedText"] == "a"
+
+    def test_type_returns_character_count(self):
+        """type() must return {"typed": len(text)}."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(10.0, 20.0)):
+            result = type_text("#input", "hello")
+
+        assert result == {"typed": 5}
+
+    def test_type_empty_string_sends_only_click_events(self):
+        """type() with empty string must send 3 mouse events and 0 key events."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", return_value=(10.0, 20.0)):
+            result = type_text("#input", "")
+
+        calls = engine.session.send.call_args_list
+        mouse_calls = [c for c in calls if c[0][0] == "Input.dispatchMouseEvent"]
+        key_calls = [c for c in calls if c[0][0] == "Input.dispatchKeyEvent"]
+        assert len(mouse_calls) == 3
+        assert len(key_calls) == 0
+        assert result == {"typed": 0}
+
+    def test_type_raises_value_error_when_selector_not_found(self):
+        """type() must propagate ValueError from _resolve_element_center."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", side_effect=ValueError("No element found")):
+            with pytest.raises(ValueError, match="No element found"):
+                type_text("#missing", "hello")
+
+
+# ── fill ──────────────────────────────────────────────────────────────────────
+
+class TestFill:
+    """Tests for the fill() tool."""
+
+    def test_fill_calls_resolve_then_runtime_evaluate(self):
+        """fill() must call _resolve_element_center and then Runtime.evaluate with selector and value."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": True}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center") as mock_resolve:
+            fill("#name", "Alice")
+
+        mock_resolve.assert_called_once_with(engine.session, "#name")
+        call_args = engine.session.send.call_args
+        assert call_args[0][0] == "Runtime.evaluate"
+        expr = call_args[0][1]["expression"]
+        assert "#name" in expr
+        assert "Alice" in expr
+
+    def test_fill_returns_filled_true(self):
+        """fill() must return {"filled": True} on success."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": True}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            result = fill("#name", "Alice")
+
+        assert result == {"filled": True}
+
+    def test_fill_raises_runtime_error_on_exception_details(self):
+        """fill() must raise RuntimeError when CDP Runtime.evaluate returns exceptionDetails."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "exceptionDetails": {"text": "syntax error"},
+            "result": {},
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            with pytest.raises(RuntimeError):
+                fill("#name", "Alice")
+
+    def test_fill_raises_value_error_when_selector_not_found(self):
+        """fill() must propagate ValueError from _resolve_element_center."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center", side_effect=ValueError("No element found")):
+            with pytest.raises(ValueError, match="No element found"):
+                fill("#missing", "value")
+
+
+# ── press_key ─────────────────────────────────────────────────────────────────
+
+class TestPressKey:
+    """Tests for the press_key() tool."""
+
+    def test_press_key_dispatches_key_down_then_key_up(self):
+        """press_key() must dispatch keyDown then keyUp with the given key."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            press_key("Enter")
+
+        calls = engine.session.send.call_args_list
+        assert len(calls) == 2
+        assert calls[0][0][0] == "Input.dispatchKeyEvent"
+        assert calls[0][0][1]["type"] == "keyDown"
+        assert calls[0][0][1]["key"] == "Enter"
+        assert calls[1][0][0] == "Input.dispatchKeyEvent"
+        assert calls[1][0][1]["type"] == "keyUp"
+        assert calls[1][0][1]["key"] == "Enter"
+
+    def test_press_key_returns_key_name(self):
+        """press_key() must return {"key": key}."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = press_key("Enter")
+
+        assert result == {"key": "Enter"}
+
+    def test_press_key_works_without_selector(self):
+        """press_key() must not call Runtime.evaluate — no selector resolution needed."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            press_key("Tab")
+
+        # Only Input.dispatchKeyEvent calls, no Runtime.evaluate
+        for call in engine.session.send.call_args_list:
+            assert call[0][0] == "Input.dispatchKeyEvent"
+
+
+# ── select_option ─────────────────────────────────────────────────────────────
+
+class TestSelectOption:
+    """Tests for the select_option() tool."""
+
+    def test_select_option_dispatches_runtime_evaluate(self):
+        """select_option() must call Runtime.evaluate with an expression containing selector and value."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": {"ok": True}}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            select_option("#color", "blue")
+
+        call_args = engine.session.send.call_args
+        assert call_args[0][0] == "Runtime.evaluate"
+        expr = call_args[0][1]["expression"]
+        assert "#color" in expr
+        assert "blue" in expr
+
+    def test_select_option_returns_selected_value(self):
+        """select_option() must return {"selected": value} on success."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": {"ok": True}}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            result = select_option("#color", "blue")
+
+        assert result == {"selected": "blue"}
+
+    def test_select_option_raises_value_error_on_not_found(self):
+        """select_option() must raise ValueError when JS reports reason='not_found'."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": {"ok": False, "reason": "not_found"}}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            with pytest.raises(ValueError, match="No element found"):
+                select_option("#missing", "blue")
+
+    def test_select_option_raises_value_error_on_invalid_value(self):
+        """select_option() must raise ValueError when JS reports reason='invalid_value'."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": {"ok": False, "reason": "invalid_value", "options": ["a", "b"]}}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            with pytest.raises(ValueError, match="not in options"):
+                select_option("#color", "blue")
+
+    def test_select_option_raises_runtime_error_on_exception_details(self):
+        """select_option() must raise RuntimeError when CDP returns exceptionDetails."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "exceptionDetails": {"text": "some error"},
+            "result": {},
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            with pytest.raises(RuntimeError):
+                select_option("#color", "blue")
