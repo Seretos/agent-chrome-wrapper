@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import dataclasses
 import datetime
+import logging
 import subprocess
+import sys
 import tempfile
 import threading
 from contextlib import asynccontextmanager
@@ -123,7 +125,12 @@ def _get_engine() -> ChromeEngine:
         session_id=session_id,
     )
     engine.session = CDPSession(port=port)
-    engine.session.connect()   # raises → _engine stays None (no cache poison)
+    try:
+        engine.session.connect()
+    except Exception:
+        terminate_chrome(proc, user_data_dir)
+        delete_state(session_id)
+        raise
     _engine = engine
     return _engine
 
@@ -307,4 +314,9 @@ def get_instance_info() -> dict:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     mcp.run()
