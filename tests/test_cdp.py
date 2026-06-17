@@ -48,7 +48,7 @@ class TestCDPSessionConnect:
         pass
 
     def test_connect_sends_enable_commands_in_order(self):
-        """Page/Runtime/DOM/Target .enable are sent after WebSocket handshake.
+        """Page/Runtime/DOM .enable are sent after WebSocket handshake.
 
         Deterministic: on_open is fired synchronously inside the mock
         run_forever() so there is no wall-clock sleep and no race.
@@ -90,7 +90,6 @@ class TestCDPSessionConnect:
             "Page.enable",
             "Runtime.enable",
             "DOM.enable",
-            "Target.enable",
         ]
 
     def test_connect_raises_if_no_page_target(self):
