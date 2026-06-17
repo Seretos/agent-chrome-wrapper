@@ -498,6 +498,311 @@ def get_network_log() -> list:
     return list(old)
 
 
+def _resolve_element_center(session: CDPSession, selector: str) -> tuple[float, float]:
+    """Resolve *selector* to viewport center coordinates (x, y).
+
+    Uses a single Runtime.evaluate round-trip: queries the element, scrolls it
+    into view, and returns the center of its bounding rect.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector*.
+    RuntimeError
+        If the Runtime.evaluate call returns exceptionDetails.
+    """
+    expr = (
+        f"(function(){{"
+        f"  var el = document.querySelector({selector!r});"
+        f"  if (!el) return null;"
+        f"  el.scrollIntoView({{block:'center',inline:'center'}});"
+        f"  var r = el.getBoundingClientRect();"
+        f"  return {{x: r.left + r.width/2, y: r.top + r.height/2}};"
+        f"}})();"
+    )
+    result = session.send(
+        "Runtime.evaluate",
+        {"expression": expr, "awaitPromise": False, "returnByValue": True},
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(
+            f"JS exception resolving selector {selector!r}: "
+            f"{result['exceptionDetails']}"
+        )
+    value = result.get("result", {}).get("value")
+    if value is None:
+        raise ValueError(f"No element found for selector {selector!r}")
+    return float(value["x"]), float(value["y"])
+
+
+@mcp.tool()
+def click(selector: str) -> dict:
+    """Click the first element matching *selector* using trusted mouse events.
+
+    Scrolls the element into view, moves the mouse to its center, then
+    dispatches mousePressed and mouseReleased via ``Input.dispatchMouseEvent``
+    so that ``event.isTrusted === true`` inside the page.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string, e.g. ``"#submit-btn"`` or ``"button.primary"``.
+
+    Returns
+    -------
+    dict
+        ``{"x": float, "y": float}`` — the viewport coordinates of the click.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector*.
+    """
+    engine = _get_engine()
+    session = engine.session
+    x, y = _resolve_element_center(session, selector)
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseMoved", "x": x, "y": y, "button": "none",
+    })
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": x, "y": y,
+        "button": "left", "clickCount": 1,
+    })
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": x, "y": y,
+        "button": "left", "clickCount": 1,
+    })
+    return {"x": x, "y": y}
+
+
+@mcp.tool()
+def hover(selector: str) -> dict:
+    """Move the mouse to the center of the first element matching *selector*.
+
+    Dispatches a trusted ``mousemove`` event via ``Input.dispatchMouseEvent``,
+    which activates CSS ``:hover`` states and triggers ``mouseenter``/
+    ``mouseover`` handlers.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string.
+
+    Returns
+    -------
+    dict
+        ``{"x": float, "y": float}`` — the viewport coordinates of the hover.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector*.
+    """
+    engine = _get_engine()
+    session = engine.session
+    x, y = _resolve_element_center(session, selector)
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseMoved", "x": x, "y": y, "button": "none",
+    })
+    return {"x": x, "y": y}
+
+
+@mcp.tool()
+def type(selector: str, text: str) -> dict:
+    """Focus *selector* and type *text* using trusted keyboard events.
+
+    Clicks the element first to give it focus, then dispatches
+    ``Input.dispatchKeyEvent`` keyDown + keyUp for each character so that
+    ``event.isTrusted`` is ``true`` and ``keydown``/``keyup`` handlers fire.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string identifying the input element.
+    text:
+        The string to type, one character at a time.
+
+    Returns
+    -------
+    dict
+        ``{"typed": int}`` — number of characters dispatched.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector*.
+    """
+    engine = _get_engine()
+    session = engine.session
+    x, y = _resolve_element_center(session, selector)
+    # Click to focus the element before typing.
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseMoved", "x": x, "y": y, "button": "none",
+    })
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1,
+    })
+    session.send("Input.dispatchMouseEvent", {
+        "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1,
+    })
+    for char in text:
+        session.send("Input.dispatchKeyEvent", {
+            "type": "keyDown", "text": char, "unmodifiedText": char,
+        })
+        session.send("Input.dispatchKeyEvent", {
+            "type": "keyUp", "text": char, "unmodifiedText": char,
+        })
+    return {"typed": len(text)}
+
+
+@mcp.tool()
+def fill(selector: str, value: str) -> dict:
+    """Set the value of *selector* and dispatch input/change events.
+
+    Unlike ``type()``, this sets the element's ``.value`` property directly and
+    fires synthetic ``input`` and ``change`` events — suitable for programmatic
+    form-fill where character-by-character key replay is undesirable (e.g. large
+    text, password fields, date pickers).
+
+    Uses the native input value setter so that React-controlled inputs register
+    the change correctly before the events are dispatched.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string identifying the input/textarea/select element.
+    value:
+        The value to set.
+
+    Returns
+    -------
+    dict
+        ``{"filled": True}`` on success.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector*.
+    RuntimeError
+        If the JS evaluation raises an exception.
+    """
+    engine = _get_engine()
+    session = engine.session
+    # Scroll into view; coordinates are not needed for value-setting.
+    _resolve_element_center(session, selector)
+    expr = (
+        f"(function(){{"
+        f"  var el = document.querySelector({selector!r});"
+        f"  if (!el) return false;"
+        f"  var nativeInputValueSetter = Object.getOwnPropertyDescriptor("
+        f"    Object.getPrototypeOf(el), 'value')?.set;"
+        f"  if (nativeInputValueSetter) {{"
+        f"    nativeInputValueSetter.call(el, {value!r});"
+        f"  }} else {{"
+        f"    el.value = {value!r};"
+        f"  }}"
+        f"  el.dispatchEvent(new Event('input', {{bubbles: true}}));"
+        f"  el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        f"  return true;"
+        f"}})();"
+    )
+    result = session.send(
+        "Runtime.evaluate",
+        {"expression": expr, "awaitPromise": False, "returnByValue": True},
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(
+            f"JS exception in fill() for selector {selector!r}: "
+            f"{result['exceptionDetails']}"
+        )
+    return {"filled": True}
+
+
+@mcp.tool()
+def press_key(key: str) -> dict:
+    """Press a keyboard key on the currently focused element.
+
+    Dispatches ``Input.dispatchKeyEvent`` keyDown + keyUp for *key*.  Use
+    standard DOM ``KeyboardEvent.key`` values: ``"Enter"``, ``"Tab"``,
+    ``"Escape"``, ``"ArrowDown"``, ``" "`` (Space), etc.
+
+    Parameters
+    ----------
+    key:
+        A DOM ``KeyboardEvent.key`` value.
+
+    Returns
+    -------
+    dict
+        ``{"key": key}`` — the key that was pressed.
+    """
+    engine = _get_engine()
+    session = engine.session
+    session.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": key})
+    session.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": key})
+    return {"key": key}
+
+
+@mcp.tool()
+def select_option(selector: str, value: str) -> dict:
+    """Select an option in a ``<select>`` element by value.
+
+    Sets the element's ``.value`` to *value* and dispatches a ``change`` event
+    so that framework listeners are notified.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector identifying the ``<select>`` element.
+    value:
+        The ``value`` attribute of the ``<option>`` to select.
+
+    Returns
+    -------
+    dict
+        ``{"selected": value}`` on success.
+
+    Raises
+    ------
+    ValueError
+        If no element matches *selector* or the value is not among the options.
+    RuntimeError
+        If the JS evaluation raises an exception.
+    """
+    engine = _get_engine()
+    session = engine.session
+    _resolve_element_center(session, selector)
+    expr = (
+        f"(function(){{"
+        f"  var el = document.querySelector({selector!r});"
+        f"  if (!el) return {{ok: false, reason: 'not_found'}};"
+        f"  var opts = Array.from(el.options).map(function(o){{return o.value;}});"
+        f"  if (!opts.includes({value!r})) return {{ok: false, reason: 'invalid_value', options: opts}};"
+        f"  el.value = {value!r};"
+        f"  el.dispatchEvent(new Event('change', {{bubbles: true}}));"
+        f"  return {{ok: true}};"
+        f"}})();"
+    )
+    result = session.send(
+        "Runtime.evaluate",
+        {"expression": expr, "awaitPromise": False, "returnByValue": True},
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(
+            f"JS exception in select_option() for selector {selector!r}: "
+            f"{result['exceptionDetails']}"
+        )
+    rv = result.get("result", {}).get("value", {})
+    if not rv.get("ok"):
+        reason = rv.get("reason", "unknown")
+        if reason == "not_found":
+            raise ValueError(f"No element found for selector {selector!r}")
+        raise ValueError(
+            f"Value {value!r} not in options for {selector!r}: {rv.get('options')}"
+        )
+    return {"selected": value}
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.WARNING,
