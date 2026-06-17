@@ -202,6 +202,9 @@ class TestGetEngineReattach:
             ) as mock_launch,
             mock.patch.object(CDPSession, "__init__", return_value=None),
             mock.patch.object(CDPSession, "connect", return_value=None),
+            mock.patch(
+                "chrome_wrapper_plugin.server._attach_buffers"
+            ) as mock_attach_buffers,
         ):
             engine = _get_engine()
 
@@ -209,6 +212,7 @@ class TestGetEngineReattach:
         assert engine.port == 9300
         assert engine.session_id == "eng-session"
         mock_launch.assert_not_called()
+        mock_attach_buffers.assert_called_once_with(engine)
 
     def teardown_method(self):
         server_module._engine = None
@@ -256,6 +260,9 @@ class TestGetEngineFreshLaunch:
             ),
             mock.patch.object(CDPSession, "__init__", return_value=None),
             mock.patch.object(CDPSession, "connect", return_value=None),
+            mock.patch(
+                "chrome_wrapper_plugin.server._attach_buffers"
+            ) as mock_attach_buffers,
         ):
             engine = _get_engine()
 
@@ -266,6 +273,7 @@ class TestGetEngineFreshLaunch:
         assert saved.port == 9400
         assert engine.port == 9400
         assert engine.proc is fake_proc
+        mock_attach_buffers.assert_called_once_with(engine)
 
     def teardown_method(self):
         server_module._engine = None
@@ -324,11 +332,15 @@ class TestGetEngineAttachesSession:
             mock.patch("chrome_wrapper_plugin.server.launch_chrome"),
             mock.patch.object(CDPSession, "__init__", return_value=None) as mock_init,
             mock.patch.object(CDPSession, "connect", return_value=None) as mock_connect,
+            mock.patch(
+                "chrome_wrapper_plugin.server._attach_buffers"
+            ) as mock_attach_buffers,
         ):
             engine = _get_engine()
 
         assert isinstance(engine.session, CDPSession)
         mock_connect.assert_called_once()
+        mock_attach_buffers.assert_called_once_with(engine)
 
     def test_fresh_launch_path_attaches_session(self, monkeypatch, tmp_path):
         """Fresh-launch path: engine.session is a CDPSession and connect() called once."""
@@ -358,11 +370,15 @@ class TestGetEngineAttachesSession:
             mock.patch("tempfile.mkdtemp", return_value=str(tmp_path / "udd")),
             mock.patch.object(CDPSession, "__init__", return_value=None) as mock_init,
             mock.patch.object(CDPSession, "connect", return_value=None) as mock_connect,
+            mock.patch(
+                "chrome_wrapper_plugin.server._attach_buffers"
+            ) as mock_attach_buffers,
         ):
             engine = _get_engine()
 
         assert isinstance(engine.session, CDPSession)
         mock_connect.assert_called_once()
+        mock_attach_buffers.assert_called_once_with(engine)
 
 
 # ── TestGetEnginePoisonedCache ────────────────────────────────────────────────

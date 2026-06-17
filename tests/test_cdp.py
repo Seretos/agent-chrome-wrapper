@@ -90,6 +90,51 @@ class TestCDPSessionConnect:
             "Page.enable",
             "Runtime.enable",
             "DOM.enable",
+            "Network.enable",
+            "Log.enable",
+        ]
+
+    def test_connect_sends_network_and_log_enable(self):
+        """Network.enable and Log.enable are sent after the three existing enables.
+
+        Verifies the full five-element enable sequence introduced by ticket #16.
+        Uses the same synchronous mock pattern as the preceding test.
+        """
+        session = CDPSession(port=9222, timeout=5.0)
+
+        fake_resp = mock.MagicMock()
+        fake_resp.__enter__ = lambda s: s
+        fake_resp.__exit__ = mock.MagicMock(return_value=False)
+        fake_resp.read.return_value = _make_targets_response()
+
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
+            app = mock.MagicMock()
+
+            def _run_forever():
+                on_open(app)
+
+            app.run_forever.side_effect = _run_forever
+            return app
+
+        sent_methods: list[str] = []
+
+        def fake_send(method, params=None):
+            sent_methods.append(method)
+            return {}
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=fake_resp),
+            mock.patch("websocket.WebSocketApp", side_effect=fake_ws_app_ctor),
+            mock.patch.object(session, "send", side_effect=fake_send),
+        ):
+            session.connect()
+
+        assert sent_methods == [
+            "Page.enable",
+            "Runtime.enable",
+            "DOM.enable",
+            "Network.enable",
+            "Log.enable",
         ]
 
     def test_connect_raises_if_no_page_target(self):

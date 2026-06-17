@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import collections
 import dataclasses
 import datetime
 import logging
@@ -62,9 +63,119 @@ class ChromeEngine:
     user_data_dir: Path
     session_id: str
     session: Optional[CDPSession] = dataclasses.field(default=None)
+    # Ring buffers populated by CDP-event listeners; drained (cleared) on each tool call.
+    console_buffer: collections.deque = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=500)
+    )
+    network_buffer: collections.deque = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=500)
+    )
+    # Side-map populated by Network.requestWillBeSent on the WS thread.
+    # Keyed by requestId (str); used to populate the `url` field of
+    # Network.loadingFailed events, which carry no url of their own.
+    # Entries are pruned on loadingFailed and responseReceived to bound size.
+    request_url_map: dict = dataclasses.field(default_factory=dict)
 
 
 _engine: Optional[ChromeEngine] = None
+
+
+def _attach_buffers(engine: ChromeEngine) -> None:
+    """Register CDP-event listeners that populate the console and network ring buffers.
+
+    Called immediately after engine.session.connect() on both the reattach path
+    and the fresh-launch path.  Each callback receives the CDP params dict that
+    CDPSession dispatches, and appends a normalised entry to the appropriate buffer.
+    The buffers are drained (cleared) when the corresponding tool is called.
+    """
+    session = engine.session
+
+    def _on_console_api(params: dict) -> None:
+        # CDP sends the severity as "type" (e.g. "log", "warning", "error");
+        # we store it under "level" to match the normalised entry shape.
+        engine.console_buffer.append(
+            {
+                "type": "consoleAPI",
+                "level": params.get("type"),
+                "args": params.get("args"),
+                "timestamp": params.get("timestamp"),
+            }
+        )
+
+    def _on_exception_thrown(params: dict) -> None:
+        detail = params.get("exceptionDetails", {})
+        engine.console_buffer.append(
+            {
+                "type": "exception",
+                "text": detail.get("text"),
+                "exception": detail.get("exception"),
+                "url": detail.get("url"),
+                "lineNumber": detail.get("lineNumber"),
+                "timestamp": params.get("timestamp"),
+            }
+        )
+
+    def _on_log_entry(params: dict) -> None:
+        entry = params.get("entry", {})
+        engine.console_buffer.append(
+            {
+                "type": "log",
+                "level": entry.get("level"),
+                "text": entry.get("text"),
+                "source": entry.get("source"),
+                "url": entry.get("url"),
+                "timestamp": entry.get("timestamp"),
+            }
+        )
+
+    def _on_request_will_be_sent(params: dict) -> None:
+        # Maintain a requestId → url side-map so that loadingFailed events
+        # (which carry no url) can still report the originating URL.
+        request_id = params.get("requestId")
+        url = (params.get("request") or {}).get("url")
+        if request_id is not None and url is not None:
+            engine.request_url_map[request_id] = url
+
+    def _on_response_received(params: dict) -> None:
+        response = params.get("response", {})
+        request_id = params.get("requestId")
+        # Prune the side-map entry now that the request is settled.
+        engine.request_url_map.pop(request_id, None)
+        engine.network_buffer.append(
+            {
+                "event": "responseReceived",
+                "requestId": request_id,
+                "url": response.get("url"),
+                "status": response.get("status"),
+                "mimeType": response.get("mimeType"),
+                "timing": response.get("timing"),
+                "timestamp": params.get("timestamp"),
+            }
+        )
+
+    def _on_loading_failed(params: dict) -> None:
+        # Network.loadingFailed has no url/documentURL field in its top-level
+        # params.  We look up the originating URL from the requestWillBeSent
+        # side-map and prune that entry now that the request is settled.
+        request_id = params.get("requestId")
+        url = engine.request_url_map.pop(request_id, None)
+        engine.network_buffer.append(
+            {
+                "event": "loadingFailed",
+                "requestId": request_id,
+                "url": url,
+                "errorText": params.get("errorText"),
+                "canceled": params.get("canceled"),
+                "timestamp": params.get("timestamp"),
+            }
+        )
+
+    session.add_listener("Runtime.consoleAPICalled", _on_console_api)
+    session.add_listener("Runtime.exceptionThrown", _on_exception_thrown)
+    session.add_listener("Log.entryAdded", _on_log_entry)
+    session.add_listener("Network.requestWillBeSent", _on_request_will_be_sent)
+    session.add_listener("Network.responseReceived", _on_response_received)
+    session.add_listener("Network.loadingFailed", _on_loading_failed)
 
 
 def _get_engine() -> ChromeEngine:
@@ -92,6 +203,7 @@ def _get_engine() -> ChromeEngine:
         )
         engine.session = CDPSession(port=state.port)
         engine.session.connect()   # raises → _engine stays None (no cache poison)
+        _attach_buffers(engine)
         _engine = engine
         return _engine
 
@@ -131,6 +243,7 @@ def _get_engine() -> ChromeEngine:
         terminate_chrome(proc, user_data_dir)
         delete_state(session_id)
         raise
+    _attach_buffers(engine)
     _engine = engine
     return _engine
 
@@ -311,6 +424,78 @@ def get_instance_info() -> dict:
         "hwnd": hwnd,
         "window_title": window_title,
     }
+
+
+@mcp.tool()
+def get_console_logs() -> list:
+    """Return and drain all buffered browser console entries since the last call.
+
+    Collects entries from three CDP event streams:
+
+    - **consoleAPI** (``Runtime.consoleAPICalled``): explicit ``console.log/warn/error``
+      etc. calls from page JavaScript.  Each entry has keys ``type`` (``"consoleAPI"``),
+      ``level`` (e.g. ``"log"``, ``"warning"``, ``"error"``), ``args`` (list of remote
+      objects), and ``timestamp``.
+
+    - **exception** (``Runtime.exceptionThrown``): uncaught JavaScript exceptions.
+      Each entry has keys ``type`` (``"exception"``), ``text``, ``exception``,
+      ``url``, ``lineNumber``, and ``timestamp``.
+
+    - **log** (``Log.entryAdded``): Chrome's browser-level log, which includes
+      security warnings, deprecations, and network-level errors that do not surface
+      through the Runtime domain.  Each entry has keys ``type`` (``"log"``),
+      ``level``, ``text``, ``source``, ``url``, and ``timestamp``.
+
+    The buffer holds at most 500 entries (oldest are dropped when full).
+    Calling this tool clears the buffer so each call returns only new entries.
+
+    Returns
+    -------
+    list
+        A list of entry dicts (may be empty if nothing was logged).
+    """
+    engine = _get_engine()
+    # Atomic swap: replace the buffer with a fresh deque before iterating so
+    # items appended by the WS thread between list() and clear() are not lost.
+    # The callbacks close over `engine` and read engine.console_buffer on each
+    # invocation, so they will append to the new deque going forward.
+    old = engine.console_buffer
+    engine.console_buffer = collections.deque(maxlen=500)
+    return list(old)
+
+
+@mcp.tool()
+def get_network_log() -> list:
+    """Return and drain all buffered network events since the last call.
+
+    Collects entries from two CDP event streams:
+
+    - **responseReceived** (``Network.responseReceived``): a response was received
+      for a network request.  Each entry has keys ``event`` (``"responseReceived"``),
+      ``requestId``, ``url``, ``status`` (HTTP status code), ``mimeType``,
+      ``timing``, and ``timestamp``.
+
+    - **loadingFailed** (``Network.loadingFailed``): a network request failed to
+      load (DNS error, blocked by CSP, cancelled, etc.).  Each entry has keys
+      ``event`` (``"loadingFailed"``), ``requestId``, ``url``, ``errorText``,
+      ``canceled`` (bool or None), and ``timestamp``.
+
+    The buffer holds at most 500 entries (oldest are dropped when full).
+    Calling this tool clears the buffer so each call returns only new entries.
+
+    Returns
+    -------
+    list
+        A list of event dicts (may be empty if no network activity was captured).
+    """
+    engine = _get_engine()
+    # Atomic swap: replace the buffer with a fresh deque before iterating so
+    # items appended by the WS thread between list() and clear() are not lost.
+    # The callbacks close over `engine` and read engine.network_buffer on each
+    # invocation, so they will append to the new deque going forward.
+    old = engine.network_buffer
+    engine.network_buffer = collections.deque(maxlen=500)
+    return list(old)
 
 
 def main() -> None:
