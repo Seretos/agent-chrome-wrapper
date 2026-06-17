@@ -7,6 +7,7 @@ attach a MagicMock as engine.session.
 from __future__ import annotations
 
 import base64
+import collections
 import threading
 from pathlib import Path
 from unittest import mock
@@ -16,8 +17,11 @@ import pytest
 import chrome_wrapper_plugin.server as server_module
 from chrome_wrapper_plugin.server import (
     ChromeEngine,
+    _attach_buffers,
     cdp,
     evaluate_js,
+    get_console_logs,
+    get_network_log,
     get_page_info,
     navigate,
     screenshot,
@@ -350,3 +354,392 @@ class TestCdpRaw:
             result = cdp("Page.reload", {})
 
         assert result == {}
+
+
+# ── get_console_logs ──────────────────────────────────────────────────────────
+
+def _fake_engine_with_real_buffers() -> ChromeEngine:
+    """Return a ChromeEngine with real deque buffers and a MagicMock session.
+
+    Uses real collections.deque instances (not mocked) so drain semantics are
+    observable in the tests below.
+    """
+    import collections
+    engine = ChromeEngine(
+        proc=None,
+        port=9222,
+        user_data_dir=Path("/tmp/udd"),
+        session_id="test-session",
+    )
+    engine.session = mock.MagicMock()
+    # Replace the default deques with fresh ones (same maxlen=500) to be explicit
+    engine.console_buffer = collections.deque(maxlen=500)
+    engine.network_buffer = collections.deque(maxlen=500)
+    return engine
+
+
+class TestGetConsoleLogs:
+    """Tests for the get_console_logs() tool — drain semantics included."""
+
+    def test_returns_empty_list_when_buffer_is_empty(self):
+        """get_console_logs() returns [] when no console events have been captured."""
+        engine = _fake_engine_with_real_buffers()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_console_logs()
+
+        assert result == []
+
+    def test_returns_buffered_entries(self):
+        """get_console_logs() returns all entries currently in the console buffer."""
+        engine = _fake_engine_with_real_buffers()
+        entry1 = {"type": "consoleAPI", "level": "log", "args": [], "timestamp": 1.0}
+        entry2 = {"type": "exception", "text": "Uncaught", "exception": None,
+                   "url": "https://example.com", "lineNumber": 10, "timestamp": 2.0}
+        engine.console_buffer.append(entry1)
+        engine.console_buffer.append(entry2)
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_console_logs()
+
+        assert result == [entry1, entry2]
+
+    def test_drains_buffer_on_read(self):
+        """A second call to get_console_logs() returns [] — the buffer is drained on first read."""
+        engine = _fake_engine_with_real_buffers()
+        engine.console_buffer.append({"type": "consoleAPI", "level": "warn",
+                                      "args": [], "timestamp": 3.0})
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            first = get_console_logs()
+            second = get_console_logs()
+
+        assert len(first) == 1
+        assert second == []
+
+
+# ── get_network_log ───────────────────────────────────────────────────────────
+
+class TestGetNetworkLog:
+    """Tests for the get_network_log() tool — drain semantics included."""
+
+    def test_returns_empty_list_when_buffer_is_empty(self):
+        """get_network_log() returns [] when no network events have been captured."""
+        engine = _fake_engine_with_real_buffers()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_network_log()
+
+        assert result == []
+
+    def test_returns_buffered_entries(self):
+        """get_network_log() returns all entries currently in the network buffer."""
+        engine = _fake_engine_with_real_buffers()
+        entry1 = {"event": "responseReceived", "requestId": "r1",
+                   "url": "https://example.com/api", "status": 200,
+                   "mimeType": "application/json", "timing": None, "timestamp": 1.5}
+        entry2 = {"event": "loadingFailed", "requestId": "r2",
+                   "url": "https://example.com/missing", "errorText": "net::ERR_NAME_NOT_RESOLVED",
+                   "canceled": False, "timestamp": 2.5}
+        engine.network_buffer.append(entry1)
+        engine.network_buffer.append(entry2)
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_network_log()
+
+        assert result == [entry1, entry2]
+
+    def test_drains_buffer_on_read(self):
+        """A second call to get_network_log() returns [] — the buffer is drained on first read."""
+        engine = _fake_engine_with_real_buffers()
+        engine.network_buffer.append({"event": "responseReceived", "requestId": "r3",
+                                       "url": "https://example.com", "status": 404,
+                                       "mimeType": "text/html", "timing": None,
+                                       "timestamp": 4.0})
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            first = get_network_log()
+            second = get_network_log()
+
+        assert len(first) == 1
+        assert second == []
+
+
+# ── _attach_buffers callback-level tests ─────────────────────────────────────
+#
+# These tests call _attach_buffers() on a real ChromeEngine with a MagicMock
+# session, capture the registered callbacks via add_listener.call_args_list,
+# then invoke each callback with a representative raw CDP params dict (the
+# real shape Chrome sends) and assert the normalised output in the buffer.
+
+def _make_engine_for_attach() -> ChromeEngine:
+    """Return a fresh ChromeEngine with a MagicMock session for callback tests."""
+    engine = ChromeEngine(
+        proc=None,
+        port=9222,
+        user_data_dir=Path("/tmp/udd"),
+        session_id="cb-test",
+    )
+    engine.session = mock.MagicMock()
+    return engine
+
+
+def _extract_callbacks(engine: ChromeEngine) -> dict:
+    """Call _attach_buffers and return a {event_name: callback} mapping.
+
+    Inspects engine.session.add_listener.call_args_list after the call.
+    """
+    _attach_buffers(engine)
+    callbacks = {}
+    for call in engine.session.add_listener.call_args_list:
+        event_name, cb = call[0]
+        callbacks[event_name] = cb
+    return callbacks
+
+
+class TestAttachBuffersCallbacks:
+    """Verify that each CDP callback registered by _attach_buffers normalises
+    raw params correctly and appends the right entry to the buffer."""
+
+    def test_console_api_called_normalises_entry(self):
+        """Runtime.consoleAPICalled callback stores CDP 'type' as 'level'."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        raw_params = {
+            "type": "warning",
+            "args": [{"type": "string", "value": "bad input"}],
+            "timestamp": 1001.5,
+            "executionContextId": 1,
+        }
+        cbs["Runtime.consoleAPICalled"](raw_params)
+
+        assert len(engine.console_buffer) == 1
+        entry = engine.console_buffer[0]
+        assert entry["type"] == "consoleAPI"
+        # CDP 'type' field is stored as 'level' in the normalised entry.
+        assert entry["level"] == "warning"
+        assert entry["args"] == raw_params["args"]
+        assert entry["timestamp"] == 1001.5
+
+    def test_exception_thrown_normalises_entry(self):
+        """Runtime.exceptionThrown callback extracts fields from exceptionDetails."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        raw_params = {
+            "timestamp": 2002.0,
+            "exceptionDetails": {
+                "text": "Uncaught ReferenceError: x is not defined",
+                "exception": {"type": "object", "subtype": "error"},
+                "url": "https://example.com/app.js",
+                "lineNumber": 42,
+                "columnNumber": 7,
+            },
+        }
+        cbs["Runtime.exceptionThrown"](raw_params)
+
+        assert len(engine.console_buffer) == 1
+        entry = engine.console_buffer[0]
+        assert entry["type"] == "exception"
+        assert entry["text"] == "Uncaught ReferenceError: x is not defined"
+        assert entry["url"] == "https://example.com/app.js"
+        assert entry["lineNumber"] == 42
+        assert entry["timestamp"] == 2002.0
+
+    def test_log_entry_added_normalises_entry(self):
+        """Log.entryAdded callback extracts fields from nested 'entry' dict."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        raw_params = {
+            "entry": {
+                "level": "error",
+                "text": "Mixed Content: blocked",
+                "source": "security",
+                "url": "http://insecure.example.com/img.png",
+                "timestamp": 3003.0,
+            }
+        }
+        cbs["Log.entryAdded"](raw_params)
+
+        assert len(engine.console_buffer) == 1
+        entry = engine.console_buffer[0]
+        assert entry["type"] == "log"
+        assert entry["level"] == "error"
+        assert entry["text"] == "Mixed Content: blocked"
+        assert entry["source"] == "security"
+        assert entry["url"] == "http://insecure.example.com/img.png"
+
+    def test_request_will_be_sent_populates_side_map(self):
+        """Network.requestWillBeSent callback stores requestId→url in request_url_map."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        raw_params = {
+            "requestId": "req-abc",
+            "frameId": "frame-1",
+            "type": "Document",
+            "request": {
+                "url": "https://example.com/page",
+                "method": "GET",
+                "headers": {},
+            },
+            "timestamp": 100.0,
+        }
+        cbs["Network.requestWillBeSent"](raw_params)
+
+        assert engine.request_url_map.get("req-abc") == "https://example.com/page"
+        # Should NOT add anything to network_buffer
+        assert len(engine.network_buffer) == 0
+
+    def test_response_received_normalises_entry(self):
+        """Network.responseReceived callback extracts url/status/mimeType from 'response'."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        # Pre-populate side-map (as requestWillBeSent would have)
+        engine.request_url_map["req-xyz"] = "https://api.example.com/data"
+
+        raw_params = {
+            "requestId": "req-xyz",
+            "frameId": "frame-1",
+            "timestamp": 200.5,
+            "type": "XHR",
+            "response": {
+                "url": "https://api.example.com/data",
+                "status": 200,
+                "statusText": "OK",
+                "mimeType": "application/json",
+                "timing": {"receiveHeadersEnd": 50.0},
+            },
+        }
+        cbs["Network.responseReceived"](raw_params)
+
+        assert len(engine.network_buffer) == 1
+        entry = engine.network_buffer[0]
+        assert entry["event"] == "responseReceived"
+        assert entry["requestId"] == "req-xyz"
+        assert entry["url"] == "https://api.example.com/data"
+        assert entry["status"] == 200
+        assert entry["mimeType"] == "application/json"
+        assert entry["timing"] == {"receiveHeadersEnd": 50.0}
+        # Side-map entry should be pruned after response received
+        assert "req-xyz" not in engine.request_url_map
+
+    def test_loading_failed_url_populated_from_side_map(self):
+        """Regression: Network.loadingFailed url comes from requestWillBeSent side-map.
+
+        Before the fix, _on_loading_failed used params.get('documentURL') which
+        is not a field on Network.loadingFailed — it always returned None.
+        This test asserts the url IS populated via the side-map.
+        """
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        # Simulate requestWillBeSent having been received first
+        cbs["Network.requestWillBeSent"]({
+            "requestId": "req-fail",
+            "request": {"url": "https://missing.example.com/resource"},
+            "timestamp": 300.0,
+        })
+        assert engine.request_url_map.get("req-fail") == "https://missing.example.com/resource"
+
+        # Now simulate loadingFailed — note: NO 'url' or 'documentURL' at top level
+        raw_params = {
+            "requestId": "req-fail",
+            "timestamp": 301.0,
+            "type": "Document",
+            "errorText": "net::ERR_NAME_NOT_RESOLVED",
+            "canceled": False,
+            "blockedReason": None,
+        }
+        cbs["Network.loadingFailed"](raw_params)
+
+        assert len(engine.network_buffer) == 1
+        entry = engine.network_buffer[0]
+        assert entry["event"] == "loadingFailed"
+        assert entry["requestId"] == "req-fail"
+        # This is the regression assertion: url must be populated from the side-map
+        assert entry["url"] == "https://missing.example.com/resource"
+        assert entry["errorText"] == "net::ERR_NAME_NOT_RESOLVED"
+        assert entry["canceled"] is False
+        # Side-map entry should be pruned after failure
+        assert "req-fail" not in engine.request_url_map
+
+    def test_loading_failed_url_is_none_when_no_prior_request(self):
+        """loadingFailed with no matching requestWillBeSent gives url=None (defensive)."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        raw_params = {
+            "requestId": "req-unknown",
+            "timestamp": 400.0,
+            "errorText": "net::ERR_CONNECTION_REFUSED",
+            "canceled": False,
+        }
+        cbs["Network.loadingFailed"](raw_params)
+
+        assert len(engine.network_buffer) == 1
+        entry = engine.network_buffer[0]
+        assert entry["url"] is None
+
+    def test_request_will_be_sent_missing_request_field_is_defensive(self):
+        """requestWillBeSent with no 'request' field does not crash and skips side-map."""
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        # Malformed params with no 'request' key
+        cbs["Network.requestWillBeSent"]({"requestId": "req-bad", "timestamp": 500.0})
+
+        assert "req-bad" not in engine.request_url_map
+
+    def test_all_six_listeners_registered(self):
+        """_attach_buffers registers exactly 6 CDP event listeners."""
+        engine = _make_engine_for_attach()
+        _attach_buffers(engine)
+
+        registered_events = [
+            call[0][0] for call in engine.session.add_listener.call_args_list
+        ]
+        expected = {
+            "Runtime.consoleAPICalled",
+            "Runtime.exceptionThrown",
+            "Log.entryAdded",
+            "Network.requestWillBeSent",
+            "Network.responseReceived",
+            "Network.loadingFailed",
+        }
+        assert set(registered_events) == expected
+        assert len(registered_events) == 6
+
+    def test_atomic_swap_console_buffer_survives_concurrent_append(self):
+        """Atomic-swap drain: items appended to the NEW buffer after swap are not lost.
+
+        Simulates the race where the WS thread appends to engine.console_buffer
+        after the swap — the new item should appear on the NEXT drain, not be dropped.
+        """
+        engine = _make_engine_for_attach()
+        cbs = _extract_callbacks(engine)
+
+        # Put one entry in the buffer
+        cbs["Runtime.consoleAPICalled"]({
+            "type": "log", "args": [], "timestamp": 600.0
+        })
+
+        # Drain: atomic swap replaces the buffer
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            first = get_console_logs()
+
+        assert len(first) == 1
+
+        # Now the callback appends to the NEW (post-swap) buffer
+        cbs["Runtime.consoleAPICalled"]({
+            "type": "error", "args": [], "timestamp": 601.0
+        })
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            second = get_console_logs()
+
+        assert len(second) == 1
+        assert second[0]["level"] == "error"

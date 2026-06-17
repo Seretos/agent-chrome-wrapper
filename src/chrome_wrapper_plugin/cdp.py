@@ -132,6 +132,8 @@ class CDPSession:
                 "Page.enable",
                 "Runtime.enable",
                 "DOM.enable",
+                "Network.enable",
+                "Log.enable",
             ):
                 self.send(domain_enable)
         except Exception:
