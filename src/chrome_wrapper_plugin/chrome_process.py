@@ -111,6 +111,7 @@ def launch_chrome(user_data_dir: Path, port: int) -> subprocess.Popen:
     args = [
         str(chrome_path),
         f"--remote-debugging-port={port}",
+        "--remote-allow-origins=*",
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",

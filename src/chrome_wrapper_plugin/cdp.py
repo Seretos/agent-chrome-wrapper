@@ -56,6 +56,7 @@ class CDPSession:
         self._ws: Optional[websocket.WebSocketApp] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._connected_event = threading.Event()
+        self._connect_error: Optional[Exception] = None
 
         # Pending CDP commands: msg_id → (event, result_holder)
         # result_holder is a one-element list so we can mutate it from the
@@ -82,53 +83,61 @@ class CDPSession:
         RuntimeError
             If no page target is found on the debugging port.
         """
-        # Discover the first page target
-        url = f"http://127.0.0.1:{self._port}/json"
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            targets = json.loads(resp.read())
+        try:
+            # Discover the first page target
+            url = f"http://127.0.0.1:{self._port}/json"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                targets = json.loads(resp.read())
 
-        ws_url: Optional[str] = None
-        for t in targets:
-            if t.get("type") == "page":
-                ws_url = t.get("webSocketDebuggerUrl")
-                break
+            ws_url: Optional[str] = None
+            for t in targets:
+                if t.get("type") == "page":
+                    ws_url = t.get("webSocketDebuggerUrl")
+                    break
 
-        if ws_url is None:
-            raise RuntimeError(
-                f"No page target found on Chrome debugging port {self._port}. "
-                f"Targets: {targets!r}"
+            if ws_url is None:
+                raise RuntimeError(
+                    f"No page target found on Chrome debugging port {self._port}. "
+                    f"Targets: {targets!r}"
+                )
+
+            self._connected_event.clear()
+            self._connect_error = None
+            self._ws = websocket.WebSocketApp(
+                ws_url,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
             )
 
-        self._connected_event.clear()
-        self._ws = websocket.WebSocketApp(
-            ws_url,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-        )
-
-        self._ws_thread = threading.Thread(
-            target=self._ws.run_forever,
-            daemon=True,
-            name=f"cdp-ws-{self._port}",
-        )
-        self._ws_thread.start()
-
-        # Block until on_open fires (or until hard timeout)
-        if not self._connected_event.wait(timeout=self._timeout):
-            raise TimeoutError(
-                f"WebSocket handshake on port {self._port} did not complete "
-                f"within {self._timeout}s."
+            self._ws_thread = threading.Thread(
+                target=self._ws.run_forever,
+                daemon=True,
+                name=f"cdp-ws-{self._port}",
             )
+            self._ws_thread.start()
 
-        # Enable standard CDP domains so we can receive their events
-        for domain_enable in (
-            "Page.enable",
-            "Runtime.enable",
-            "DOM.enable",
-            "Target.enable",
-        ):
-            self.send(domain_enable)
+            # Block until on_open fires (or WS error/close, or hard timeout)
+            if not self._connected_event.wait(timeout=self._timeout):
+                raise TimeoutError(
+                    f"WebSocket handshake on port {self._port} did not complete "
+                    f"within {self._timeout}s."
+                )
+            if self._connect_error is not None:
+                raise self._connect_error
+
+            # Enable standard CDP domains so we can receive their events
+            for domain_enable in (
+                "Page.enable",
+                "Runtime.enable",
+                "DOM.enable",
+                "Target.enable",
+            ):
+                self.send(domain_enable)
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Close the WebSocket connection.  The daemon thread exits automatically."""
@@ -241,4 +250,23 @@ class CDPSession:
 
     def _on_error(self, ws: websocket.WebSocketApp, err: Exception) -> None:
         logger.error("CDPSession: WebSocket error: %s", err)
-        # Do not raise — must not crash the WS thread / MCP server
+        self._connect_error = err
+        self._connected_event.set()
+
+    def _on_close(
+        self,
+        ws: websocket.WebSocketApp,
+        close_status_code: Optional[int],
+        close_msg: Optional[str],
+    ) -> None:
+        logger.debug(
+            "CDPSession: WebSocket closed (status=%s, msg=%r)",
+            close_status_code,
+            close_msg,
+        )
+        if not self._connected_event.is_set():
+            self._connect_error = ConnectionError(
+                f"WebSocket closed before handshake completed "
+                f"(status={close_status_code}, msg={close_msg!r})"
+            )
+            self._connected_event.set()

@@ -63,7 +63,7 @@ class TestCDPSessionConnect:
         fake_resp.__exit__ = mock.MagicMock(return_value=False)
         fake_resp.read.return_value = _make_targets_response()
 
-        def fake_ws_app_ctor(url, on_open, on_message, on_error):
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
             app = mock.MagicMock()
             # run_forever fires on_open synchronously before returning so the
             # connected_event is set before connect()'s event.wait() is reached
@@ -334,3 +334,114 @@ class TestCDPSessionClose:
         self.session.close()
 
         assert self.session._pending == {}
+
+
+# ── TestCDPSessionConnectError ────────────────────────────────────────────────
+
+class TestCDPSessionConnectError:
+    """connect() fails fast and cleans up when the WebSocket reports an error."""
+
+    def setup_method(self):
+        self._session = None
+
+    def teardown_method(self):
+        pass
+
+    def _make_fake_resp(self, ws_url: str = "ws://127.0.0.1:9222/devtools/page/ABC"):
+        """Return a mock urllib response yielding a single page target."""
+        fake_resp = mock.MagicMock()
+        fake_resp.__enter__ = lambda s: s
+        fake_resp.__exit__ = mock.MagicMock(return_value=False)
+        fake_resp.read.return_value = _make_targets_response(ws_url)
+        return fake_resp
+
+    def test_connect_reraises_ws_error_verbatim(self):
+        """connect() re-raises the exact same exception object injected via on_error."""
+        session = CDPSession(port=9222, timeout=5.0)
+        injected_error = ConnectionError("403 Forbidden")
+
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
+            app = mock.MagicMock()
+
+            def _run_forever():
+                # Simulate Chrome rejecting the WS upgrade with a 403 error
+                on_error(app, injected_error)
+
+            app.run_forever.side_effect = _run_forever
+            return app
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=self._make_fake_resp()),
+            mock.patch("websocket.WebSocketApp", side_effect=fake_ws_app_ctor),
+        ):
+            with pytest.raises(ConnectionError) as exc_info:
+                session.connect()
+
+        assert exc_info.value is injected_error
+
+    def test_connect_calls_close_on_ws_error(self):
+        """connect() calls close() when the WebSocket errors so no orphan WS thread survives."""
+        session = CDPSession(port=9222, timeout=5.0)
+
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
+            app = mock.MagicMock()
+
+            def _run_forever():
+                on_error(app, ConnectionError("403 Forbidden"))
+
+            app.run_forever.side_effect = _run_forever
+            return app
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=self._make_fake_resp()),
+            mock.patch("websocket.WebSocketApp", side_effect=fake_ws_app_ctor),
+            mock.patch.object(session, "close") as mock_close,
+        ):
+            with pytest.raises(ConnectionError):
+                session.connect()
+
+        mock_close.assert_called_once()
+
+    def test_connect_raises_timeout_when_no_callback_fires(self):
+        """connect() raises TimeoutError when WS hangs and neither on_open nor on_error fires."""
+        session = CDPSession(port=9222, timeout=0.05)
+
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
+            app = mock.MagicMock()
+            # run_forever returns immediately without calling any callback,
+            # simulating a WS that hangs without completing or erroring.
+            app.run_forever.side_effect = lambda: None
+            return app
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=self._make_fake_resp()),
+            mock.patch("websocket.WebSocketApp", side_effect=fake_ws_app_ctor),
+        ):
+            with pytest.raises(TimeoutError, match="did not complete"):
+                session.connect()
+
+    def test_connect_on_close_before_open_raises(self):
+        """connect() raises ConnectionError immediately when WS closes before handshake completes.
+
+        _on_close records a ConnectionError sentinel in _connect_error and sets
+        _connected_event so connect() unblocks and re-raises immediately (fail-fast),
+        without waiting for any send() timeout.
+        """
+        session = CDPSession(port=9222, timeout=5.0)
+
+        def fake_ws_app_ctor(url, *, on_open, on_message, on_error, on_close):
+            app = mock.MagicMock()
+
+            def _run_forever():
+                # Simulate an abnormal close during handshake, before on_open fires
+                on_close(app, 1006, "abnormal")
+
+            app.run_forever.side_effect = _run_forever
+            return app
+
+        with (
+            mock.patch("urllib.request.urlopen", return_value=self._make_fake_resp()),
+            mock.patch("websocket.WebSocketApp", side_effect=fake_ws_app_ctor),
+        ):
+            with pytest.raises(ConnectionError, match="closed before handshake"):
+                session.connect()
