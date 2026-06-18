@@ -1,0 +1,19 @@
+{
+  "name": "agent-chrome-wrapper",
+  "version": "0.0.4",
+  "description": "Provides an MCP that gives agents access to Chrome, starting a separate Chrome instance for each session.",
+  "author": {
+    "name": "Arne von Appen"
+  },
+  "repository": "https://github.com/Seretos/agent-chrome-wrapper",
+  "mcpServers": {
+    "chrome-wrapper": {
+      "command": "${PLUGIN_ROOT}/bin/chrome-wrapper.exe",
+      "args": []
+    }
+  },
+  "interface": {
+    "displayName": "Agent Chrome Wrapper",
+    "shortDescription": "Provides an MCP that gives agents access to Chrome, starting a separate Chrome instance for each session."
+  }
+}
