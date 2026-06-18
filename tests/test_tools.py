@@ -31,8 +31,12 @@ from chrome_wrapper_plugin.server import (
     press_key,
     screenshot,
     select_option,
+    wait_for_selector,
+    wait_for_navigation,
+    wait_for_network_idle,
 )
 from chrome_wrapper_plugin.server import type as type_text
+from chrome_wrapper_plugin.server import sleep as sleep_tool
 from mcp.server.fastmcp import Image
 
 
@@ -1129,3 +1133,253 @@ class TestSelectOption:
              mock.patch.object(server_module, "_resolve_element_center"):
             with pytest.raises(RuntimeError):
                 select_option("#color", "blue")
+
+
+# ── wait_for_selector ─────────────────────────────────────────────────────────
+
+class TestWaitForSelector:
+    """Tests for the wait_for_selector() tool."""
+
+    def test_resolves_attached_when_element_present(self):
+        """wait_for_selector() returns correct dict when element is immediately in DOM."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": True}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = wait_for_selector("#btn", state="attached")
+
+        assert result["selector"] == "#btn"
+        assert result["state"] == "attached"
+        assert "elapsed" in result
+
+    def test_resolves_visible_when_element_visible(self):
+        """wait_for_selector() returns correct dict when element is immediately visible."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": True}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = wait_for_selector("#btn", state="visible")
+
+        assert result["selector"] == "#btn"
+        assert result["state"] == "visible"
+        assert "elapsed" in result
+
+    def test_raises_timeout_error_when_element_never_appears(self):
+        """wait_for_selector() raises TimeoutError when element is never found within timeout."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": False}}
+
+        # The implementation calls time.monotonic() in this order (after the nit fix
+        # where start and deadline share a single monotonic call):
+        #   1. start = time.monotonic()                → return T  (deadline = T + timeout)
+        #   (loop) session.send → False
+        #   2. remaining = deadline - time.monotonic() → return T + timeout + 1 → remaining = -1 ≤ 0
+        # StopIteration would surface as an exception if the list is exhausted, so provide
+        # a few extra values as a guard — they should never be consumed.
+        T = 1000.0
+        timeout = 5.0
+        monotonic_values = [T, T + timeout + 1, T + timeout + 2, T + timeout + 3]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch("chrome_wrapper_plugin.server.time.monotonic",
+                        side_effect=monotonic_values), \
+             mock.patch("chrome_wrapper_plugin.server.time.sleep"):
+            with pytest.raises(TimeoutError, match="timed out"):
+                wait_for_selector("#btn", timeout=timeout, state="attached")
+
+    def test_raises_value_error_for_unknown_state(self):
+        """wait_for_selector() raises ValueError for state other than 'attached'/'visible'.
+
+        The guard fires before _get_engine() is called, so no engine is ever
+        constructed.  We patch _get_engine with a side_effect that raises
+        AssertionError to make the test fail if the guard is ever bypassed.
+        """
+        guard = mock.MagicMock(side_effect=AssertionError("engine should not be constructed"))
+        with mock.patch.object(server_module, "_get_engine", guard):
+            with pytest.raises(ValueError, match="state="):
+                wait_for_selector("#x", state="detached")
+
+        guard.assert_not_called()
+
+    def test_raises_runtime_error_on_js_exception(self):
+        """wait_for_selector() raises RuntimeError when Runtime.evaluate returns exceptionDetails."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "exceptionDetails": {"text": "boom"},
+            "result": {},
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            with pytest.raises(RuntimeError, match="JS exception"):
+                wait_for_selector("#btn")
+
+
+# ── wait_for_navigation ───────────────────────────────────────────────────────
+
+class TestWaitForNavigation:
+    """Tests for the wait_for_navigation() tool."""
+
+    def test_resolves_on_load_event(self):
+        """wait_for_navigation() returns {"event": "Page.loadEventFired"} when load fires."""
+        engine = _fake_engine_with_session()
+
+        def _instant_listener(event_name, cb):
+            if event_name == "Page.loadEventFired":
+                cb({})
+
+        engine.session.add_listener.side_effect = _instant_listener
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = wait_for_navigation()
+
+        assert result == {"event": "Page.loadEventFired"}
+
+    def test_raises_timeout_error_when_no_load_event(self):
+        """wait_for_navigation() raises TimeoutError when Page.loadEventFired never fires."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(threading.Event, "wait", return_value=False):
+            with pytest.raises(TimeoutError, match="Page.loadEventFired not received"):
+                wait_for_navigation(timeout=5.0)
+
+    def test_removes_listener_in_finally(self):
+        """wait_for_navigation() always removes the Page.loadEventFired listener, even on TimeoutError."""
+        engine = _fake_engine_with_session()
+        captured_cb: dict = {}
+
+        def _capture_listener(event_name, cb):
+            if event_name == "Page.loadEventFired":
+                captured_cb["fn"] = cb
+
+        engine.session.add_listener.side_effect = _capture_listener
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(threading.Event, "wait", return_value=False):
+            with pytest.raises(TimeoutError):
+                wait_for_navigation(timeout=5.0)
+
+        engine.session.remove_listener.assert_called_once_with(
+            "Page.loadEventFired", captured_cb["fn"]
+        )
+
+
+# ── wait_for_network_idle ─────────────────────────────────────────────────────
+
+class TestWaitForNetworkIdle:
+    """Tests for the wait_for_network_idle() tool."""
+
+    def test_resolves_immediately_when_already_idle(self):
+        """wait_for_network_idle() returns {"event": "networkIdle"} when no requests are in flight."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = wait_for_network_idle()
+
+        assert result == {"event": "networkIdle"}
+
+    def test_resolves_after_request_completes(self):
+        """wait_for_network_idle() resolves once an in-flight request finishes.
+
+        This test exercises the counter path, NOT the pre-set fast-path.
+
+        Strategy: fire _on_request({}) from inside the add_listener side_effect
+        (while all three listeners are being registered) so that _in_flight
+        becomes 1 before the guarded pre-set runs.  The guarded pre-set then
+        sees _in_flight[0] > 0 and leaves idle_event cleared.  The tool blocks
+        on idle_event.wait().  The main thread then fires _on_done({}) which
+        decrements _in_flight to 0 and sets idle_event, unblocking the tool.
+        """
+        import threading as _threading
+
+        engine = _fake_engine_with_session()
+        captured: dict = {}
+        # Synchronise: unblocked once all three listeners are registered AND
+        # _on_request has been fired (inside the side_effect), so _in_flight==1.
+        listeners_ready = _threading.Event()
+
+        def _capture_listener(event_name, cb):
+            captured[event_name] = cb
+            # After all three listeners are captured, fire _on_request so
+            # _in_flight becomes 1 before the guarded pre-set executes.
+            if len(captured) == 3:
+                captured["Network.requestWillBeSent"]({})
+                listeners_ready.set()
+
+        engine.session.add_listener.side_effect = _capture_listener
+
+        result_holder: dict = {}
+        error_holder: dict = {}
+
+        def _run():
+            try:
+                result_holder["r"] = wait_for_network_idle()
+            except Exception as e:
+                error_holder["e"] = e
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            t = _threading.Thread(target=_run)
+            t.start()
+
+            # Wait until _on_request has been fired (in_flight==1, event cleared).
+            assert listeners_ready.wait(timeout=5.0), "Listeners never registered"
+
+            # Now fire _on_done: decrements in_flight to 0 and sets idle_event.
+            captured["Network.loadingFinished"]({})
+
+            t.join(timeout=5.0)
+
+        assert not t.is_alive(), "Tool thread did not finish — possible deadlock"
+        assert not error_holder, f"Unexpected error: {error_holder}"
+        assert result_holder.get("r") == {"event": "networkIdle"}
+
+    def test_raises_timeout_error_when_requests_never_complete(self):
+        """wait_for_network_idle() raises TimeoutError when network never goes idle."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(threading.Event, "wait", return_value=False):
+            with pytest.raises(TimeoutError, match="Network did not go idle"):
+                wait_for_network_idle(timeout=5.0)
+
+    def test_removes_all_three_listeners_in_finally(self):
+        """wait_for_network_idle() always removes all three Network listeners, even on TimeoutError."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(threading.Event, "wait", return_value=False):
+            with pytest.raises(TimeoutError):
+                wait_for_network_idle(timeout=5.0)
+
+        remove_calls = engine.session.remove_listener.call_args_list
+        removed_events = {call[0][0] for call in remove_calls}
+        assert removed_events == {
+            "Network.requestWillBeSent",
+            "Network.loadingFinished",
+            "Network.loadingFailed",
+        }
+        assert len(remove_calls) == 3
+
+
+# ── sleep ─────────────────────────────────────────────────────────────────────
+
+class TestSleep:
+    """Tests for the sleep() tool."""
+
+    def test_sleep_calls_time_sleep_and_returns_slept(self):
+        """sleep() must call time.sleep with the given duration and return {"slept": seconds}."""
+        with mock.patch("chrome_wrapper_plugin.server.time.sleep") as mock_sleep:
+            result = sleep_tool(2.5)
+
+        mock_sleep.assert_called_once_with(2.5)
+        assert result == {"slept": 2.5}
+
+    def test_sleep_raises_value_error_for_negative(self):
+        """sleep() must raise ValueError when seconds is negative."""
+        with pytest.raises(ValueError, match="between 0 and 60"):
+            sleep_tool(-1)
+
+    def test_sleep_raises_value_error_above_max(self):
+        """sleep() must raise ValueError when seconds exceeds 60."""
+        with pytest.raises(ValueError, match="between 0 and 60"):
+            sleep_tool(61)
