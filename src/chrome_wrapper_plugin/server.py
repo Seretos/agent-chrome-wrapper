@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -354,6 +355,237 @@ def evaluate_js(expression: str) -> dict:
         "Runtime.evaluate",
         {"expression": expression, "awaitPromise": True, "returnByValue": True},
     )
+
+
+@mcp.tool()
+def wait_for_selector(
+    selector: str,
+    timeout: float = 30.0,
+    state: str = "visible",
+) -> dict:
+    """Wait until a DOM element matching *selector* reaches *state*.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string.
+    timeout:
+        Maximum seconds to wait (default 30).
+    state:
+        ``"attached"`` — element exists in the DOM regardless of visibility.
+        ``"visible"``  — element exists and is not hidden (not
+        ``display:none``, not ``visibility:hidden``, non-zero bounding rect).
+
+    Returns
+    -------
+    dict
+        ``{"selector": selector, "state": state, "elapsed": float}`` on
+        success.
+
+    Raises
+    ------
+    ValueError
+        If *state* is not ``"attached"`` or ``"visible"``.
+    TimeoutError
+        If the element does not reach *state* within *timeout* seconds.
+    RuntimeError
+        If the Runtime.evaluate call returns exceptionDetails.
+    """
+    if state not in ("attached", "visible"):
+        raise ValueError(
+            f"state={state!r} is not supported; use 'attached' or 'visible'"
+        )
+
+    if state == "attached":
+        expr = (
+            f"(function(){{"
+            f"  var el = document.querySelector({selector!r});"
+            f"  return el !== null;"
+            f"}})();"
+        )
+    else:  # visible
+        expr = (
+            f"(function(){{"
+            f"  var el = document.querySelector({selector!r});"
+            f"  if (!el) return false;"
+            f"  var s = window.getComputedStyle(el);"
+            f"  if (s.display === 'none' || s.visibility === 'hidden') return false;"
+            f"  var r = el.getBoundingClientRect();"
+            f"  return r.width > 0 && r.height > 0;"
+            f"}})();"
+        )
+
+    engine = _get_engine()
+    session = engine.session
+    start = time.monotonic()
+    deadline = start + timeout
+    interval = 0.1
+
+    while True:
+        result = session.send(
+            "Runtime.evaluate",
+            {"expression": expr, "awaitPromise": False, "returnByValue": True},
+        )
+        if result.get("exceptionDetails"):
+            raise RuntimeError(
+                f"JS exception in wait_for_selector({selector!r}): "
+                f"{result['exceptionDetails']}"
+            )
+        if result.get("result", {}).get("value") is True:
+            return {
+                "selector": selector,
+                "state": state,
+                "elapsed": round(time.monotonic() - start, 3),
+            }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"wait_for_selector({selector!r}, state={state!r}) "
+                f"timed out after {timeout}s"
+            )
+        time.sleep(min(interval, remaining))
+
+
+@mcp.tool()
+def wait_for_navigation(timeout: float = 30.0) -> dict:
+    """Wait for the next page load event to fire (Page.loadEventFired).
+
+    Trigger navigation first (e.g. call ``click()`` on a link), then call
+    this tool to wait for the resulting page load to complete.
+
+    This tool waits for the NEXT ``Page.loadEventFired`` event after the
+    listener is registered.  If the page load completes before this tool is
+    called, the event will already have fired and this tool will wait for a
+    subsequent load or time out.  In a synchronous MCP server the caller
+    cannot issue the navigation-triggering action while this tool is
+    blocking, so pre-registration of the listener is not possible — trigger
+    the navigation action first, then call this tool.
+
+    Parameters
+    ----------
+    timeout:
+        Maximum seconds to wait (default 30).
+
+    Returns
+    -------
+    dict
+        ``{"event": "Page.loadEventFired"}`` on success.
+
+    Raises
+    ------
+    TimeoutError
+        If no load event fires within *timeout* seconds.
+    """
+    engine = _get_engine()
+    session = engine.session
+
+    load_event = threading.Event()
+
+    def _on_load(params: dict) -> None:  # noqa: ARG001
+        load_event.set()
+
+    session.add_listener("Page.loadEventFired", _on_load)
+    try:
+        fired = load_event.wait(timeout=timeout)
+        if not fired:
+            raise TimeoutError(
+                f"Page.loadEventFired not received within {timeout}s"
+            )
+        return {"event": "Page.loadEventFired"}
+    finally:
+        session.remove_listener("Page.loadEventFired", _on_load)
+
+
+@mcp.tool()
+def wait_for_network_idle(timeout: float = 30.0) -> dict:
+    """Wait until all in-flight network requests have completed.
+
+    Registers its own Network-domain listeners (independent of the ring-buffer
+    listeners attached by the engine at startup) to count in-flight requests.
+    Resolves when the counter reaches zero, or immediately if there are no
+    in-flight requests at call time.
+
+    Parameters
+    ----------
+    timeout:
+        Maximum seconds to wait (default 30).
+
+    Returns
+    -------
+    dict
+        ``{"event": "networkIdle"}`` on success.
+
+    Raises
+    ------
+    TimeoutError
+        If the network does not go idle within *timeout* seconds.
+    """
+    engine = _get_engine()
+    session = engine.session
+
+    idle_event = threading.Event()
+    _lock = threading.Lock()
+    _in_flight: list[int] = [0]  # mutable cell so closures can mutate it
+
+    def _on_request(params: dict) -> None:  # noqa: ARG001
+        with _lock:
+            _in_flight[0] += 1
+            idle_event.clear()
+
+    def _on_done(params: dict) -> None:  # noqa: ARG001
+        with _lock:
+            _in_flight[0] = max(0, _in_flight[0] - 1)
+            if _in_flight[0] == 0:
+                idle_event.set()
+
+    session.add_listener("Network.requestWillBeSent", _on_request)
+    session.add_listener("Network.loadingFinished", _on_done)
+    session.add_listener("Network.loadingFailed", _on_done)
+    # Pre-set only when no requests are already in flight, so that a request
+    # that arrived via the WS daemon thread during/after listener registration
+    # (which increments _in_flight) is not erroneously reported as idle.
+    with _lock:
+        if _in_flight[0] == 0:
+            idle_event.set()
+    try:
+        fired = idle_event.wait(timeout=timeout)
+        if not fired:
+            raise TimeoutError(
+                f"Network did not go idle within {timeout}s "
+                f"({_in_flight[0]} request(s) still in flight)"
+            )
+        return {"event": "networkIdle"}
+    finally:
+        session.remove_listener("Network.requestWillBeSent", _on_request)
+        session.remove_listener("Network.loadingFinished", _on_done)
+        session.remove_listener("Network.loadingFailed", _on_done)
+
+
+@mcp.tool()
+def sleep(seconds: float) -> dict:
+    """Pause execution for *seconds* seconds.
+
+    Parameters
+    ----------
+    seconds:
+        Duration to sleep.  Must be between 0 and 60 inclusive.
+
+    Returns
+    -------
+    dict
+        ``{"slept": seconds}``.
+
+    Raises
+    ------
+    ValueError
+        If *seconds* is negative or exceeds 60.
+    """
+    if seconds < 0 or seconds > 60:
+        raise ValueError(
+            f"seconds must be between 0 and 60 inclusive, got {seconds!r}"
+        )
+    time.sleep(seconds)
+    return {"slept": seconds}
 
 
 @mcp.tool()
