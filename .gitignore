@@ -18,3 +18,4 @@ dist/
 # also covered, not just the Windows .exe.
 /bin/
 *.pyinstaller.tmp/
+.process-ticket-result.json

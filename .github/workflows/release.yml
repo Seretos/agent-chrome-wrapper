@@ -219,6 +219,17 @@ jobs:
             echo "::error::missing Windows binary in merged stage"; exit 1
           fi
 
+          # The binary is built on windows-latest (no POSIX x bit) and both
+          # actions/upload-artifact and actions/download-artifact don't
+          # preserve Unix permissions, so it lands here as mode 644. Set the
+          # bit on the real working-tree file now — the subsequent `cp -a`
+          # copies (stage -> tmp -> orphan worktree) all preserve mode, so
+          # `git add` in the release-branch step sees an already-executable
+          # file instead of needing an index-only `git update-index --chmod`,
+          # which `git add -A` would otherwise silently revert (see comment
+          # in the "Push orphan release branch" step).
+          chmod +x "$STAGE/bin/chrome-wrapper.exe"
+
           ZIP="dist/agent-chrome-wrapper-${{ inputs.version }}.zip"
           mkdir -p dist
           # Use Python's zipfile so we can stamp Unix mode bits into the
@@ -281,9 +292,19 @@ jobs:
           echo "=== release branch contents ==="
           find . -mindepth 1 -not -path './.git*' | sort
 
-          git add bin/chrome-wrapper.exe
-          git update-index --chmod=+x bin/chrome-wrapper.exe
+          # Trap: `git add -A` re-stats every path against the working tree,
+          # so if it runs after `git update-index --chmod=+x` it silently
+          # reverts that index-only change back to whatever mode the file
+          # has on disk. The staging step already chmods the real file, so
+          # this `git update-index --chmod=+x` is defence in depth — but it
+          # must be the LAST mode-related git op before `git commit`, with
+          # no `git add` after it.
           git add -A
+          git update-index --chmod=+x bin/chrome-wrapper.exe
+
+          mode=$(git ls-files -s bin/chrome-wrapper.exe | awk '{print $1}')
+          [ "$mode" = "100755" ] || { echo "::error::chrome-wrapper.exe staged as ${mode}, expected 100755"; exit 1; }
+
           git commit -m "release: v${{ inputs.version }}"
           git push origin release --force
 
