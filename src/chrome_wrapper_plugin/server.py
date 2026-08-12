@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import datetime
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ from chrome_wrapper_plugin.hwnd import find_chrome_hwnd
 from chrome_wrapper_plugin.profiles import master_profile_dir, seed_profile
 from chrome_wrapper_plugin.state import (
     SessionState,
+    claim_session_slot,
     delete_state,
     is_process_alive,
     load_state,
@@ -185,14 +187,19 @@ def _get_engine() -> ChromeEngine:
     if _engine is not None:
         return _engine
 
-    session_id = resolve_session_id()
+    base_id = resolve_session_id()
 
     # Reap dead sessions so they don't accumulate temp directories
     reap_orphans()
 
+    # Claim a slot for this wrapper process. Two wrappers that resolve the
+    # same base_id (e.g. both hitting the deterministic host+user fallback)
+    # end up claiming distinct slots here instead of silently reattaching to
+    # each other's Chrome instance.
+    session_id, state = claim_session_slot(base_id)
+
     # Try to reattach to an already-running Chrome (crash-recovery path)
-    state = load_state(session_id)
-    if state is not None and is_process_alive(state.pid):
+    if state is not None and state.pid > 0 and is_process_alive(state.pid):
         # wait_for_cdp guards against a Chrome that is alive-by-PID but not
         # yet accepting CDP connections (e.g. still starting up after a crash).
         wait_for_cdp(state.port)
@@ -208,40 +215,50 @@ def _get_engine() -> ChromeEngine:
         _engine = engine
         return _engine
 
-    # Fresh launch
-    port = find_free_port()
-    # Each session gets its own ephemeral user-data-dir under the system temp
-    user_data_dir = Path(tempfile.mkdtemp(prefix=f"chrome_wrapper_{session_id}_"))
-
-    # Seed from master profile (cookies/logins) — skips gracefully if absent
-    seed_profile(master_profile_dir(), user_data_dir)
-
-    proc = launch_chrome(user_data_dir, port)
-    wait_for_cdp(port)
-
-    now = datetime.datetime.now().isoformat()
-    save_state(
-        SessionState(
-            session_id=session_id,
-            pid=proc.pid,
-            port=port,
-            user_data_dir=str(user_data_dir),
-            profile=str(master_profile_dir()),
-            created_at=now,
-        )
-    )
-
-    engine = ChromeEngine(
-        proc=proc,
-        port=port,
-        user_data_dir=user_data_dir,
-        session_id=session_id,
-    )
-    engine.session = CDPSession(port=port)
+    # Fresh launch — any failure along this path must drop the claimed slot
+    # (placeholder-or-saved state) so it does not linger and block reuse.
+    proc: Optional[subprocess.Popen] = None
+    user_data_dir: Optional[Path] = None
     try:
+        port = find_free_port()
+        # Each session gets its own ephemeral user-data-dir under the system temp
+        user_data_dir = Path(tempfile.mkdtemp(prefix=f"chrome_wrapper_{session_id}_"))
+
+        # Seed from master profile (cookies/logins) — skips gracefully if absent
+        seed_profile(master_profile_dir(), user_data_dir)
+
+        proc = launch_chrome(user_data_dir, port)
+        wait_for_cdp(port)
+
+        now = datetime.datetime.now().isoformat()
+        save_state(
+            SessionState(
+                session_id=session_id,
+                pid=proc.pid,
+                port=port,
+                user_data_dir=str(user_data_dir),
+                profile=str(master_profile_dir()),
+                created_at=now,
+                owner_pid=os.getpid(),
+            )
+        )
+
+        engine = ChromeEngine(
+            proc=proc,
+            port=port,
+            user_data_dir=user_data_dir,
+            session_id=session_id,
+        )
+        engine.session = CDPSession(port=port)
         engine.session.connect()
     except Exception:
-        terminate_chrome(proc, user_data_dir)
+        # Gate on user_data_dir, not proc: seed_profile() (or launch_chrome()
+        # itself, before it returns) can raise after mkdtemp() has already
+        # created a real temp dir but before `proc` is ever assigned.
+        # terminate_chrome() is documented safe to call with proc=None —
+        # it still rmtree()s user_data_dir, which is the cleanup we need here.
+        if user_data_dir is not None:
+            terminate_chrome(proc, user_data_dir)
         delete_state(session_id)
         raise
     _attach_buffers(engine)
