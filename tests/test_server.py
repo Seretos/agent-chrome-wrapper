@@ -7,6 +7,7 @@ Mocks _get_engine (for tool-surface tests) and individual collaborators
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ import chrome_wrapper_plugin.server as server_module
 import chrome_wrapper_plugin.state as state_module
 from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.server import ChromeEngine, _get_engine, get_instance_info
-from chrome_wrapper_plugin.state import SessionState
+from chrome_wrapper_plugin.state import SessionState, load_state, save_state
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -191,7 +192,8 @@ class TestGetEngineReattach:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=live_state
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", live_state),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.is_process_alive", return_value=True
@@ -227,8 +229,6 @@ class TestGetEngineFreshLaunch:
     def test_fresh_launch_calls_launch_chrome_and_saves_state(
         self, tmp_path, monkeypatch
     ):
-        dead_state = _make_session_state(pid=99999, port=9301)
-
         monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
 
         fake_proc = mock.MagicMock(spec=subprocess.Popen)
@@ -237,10 +237,8 @@ class TestGetEngineFreshLaunch:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=dead_state
-            ),
-            mock.patch(
-                "chrome_wrapper_plugin.server.is_process_alive", return_value=False
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", None),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.find_free_port", return_value=9400
@@ -271,6 +269,7 @@ class TestGetEngineFreshLaunch:
         saved: SessionState = mock_save.call_args[0][0]
         assert saved.pid == 12345
         assert saved.port == 9400
+        assert saved.owner_pid == os.getpid()
         assert engine.port == 9400
         assert engine.proc is fake_proc
         mock_attach_buffers.assert_called_once_with(engine)
@@ -323,7 +322,8 @@ class TestGetEngineAttachesSession:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=live_state
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", live_state),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.is_process_alive", return_value=True
@@ -344,7 +344,6 @@ class TestGetEngineAttachesSession:
 
     def test_fresh_launch_path_attaches_session(self, monkeypatch, tmp_path):
         """Fresh-launch path: engine.session is a CDPSession and connect() called once."""
-        dead_state = _make_session_state(pid=99999, port=9301)
         monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
 
         fake_proc = mock.MagicMock(spec=subprocess.Popen)
@@ -353,10 +352,8 @@ class TestGetEngineAttachesSession:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=dead_state
-            ),
-            mock.patch(
-                "chrome_wrapper_plugin.server.is_process_alive", return_value=False
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", None),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.find_free_port", return_value=9400
@@ -403,7 +400,8 @@ class TestGetEnginePoisonedCache:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=live_state
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", live_state),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.is_process_alive", return_value=True
@@ -423,7 +421,6 @@ class TestGetEnginePoisonedCache:
         self, monkeypatch, tmp_path
     ):
         """Fresh-launch path: connect() raises → _engine stays None."""
-        dead_state = _make_session_state(pid=99999, port=9301)
         monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
 
         fake_proc = mock.MagicMock(spec=subprocess.Popen)
@@ -432,10 +429,8 @@ class TestGetEnginePoisonedCache:
         with (
             mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
             mock.patch(
-                "chrome_wrapper_plugin.server.load_state", return_value=dead_state
-            ),
-            mock.patch(
-                "chrome_wrapper_plugin.server.is_process_alive", return_value=False
+                "chrome_wrapper_plugin.server.claim_session_slot",
+                return_value=("eng-session", None),
             ),
             mock.patch(
                 "chrome_wrapper_plugin.server.find_free_port", return_value=9400
@@ -456,3 +451,200 @@ class TestGetEnginePoisonedCache:
                 _get_engine()
 
         assert server_module._engine is None
+
+
+# ── TestGetEngineOwnership ────────────────────────────────────────────────────
+#
+# Regression coverage for ticket #27: two wrapper processes that resolve the
+# same base session id (e.g. both hitting the deterministic host+user
+# fallback) must never reattach to each other's Chrome instance.  Uses a real
+# tmp_path state dir (via CLAUDE_PLUGIN_DATA) and the real claim_session_slot
+# — i.e. this class exercises the real ownership-claiming logic, unlike the
+# other _get_engine tests above which mock claim_session_slot's return value.
+
+class TestGetEngineOwnership:
+    def setup_method(self):
+        server_module._engine = None
+
+    def teardown_method(self):
+        server_module._engine = None
+
+    def test_live_foreign_owner_forces_fresh_launch(self, tmp_path, monkeypatch):
+        """A slot owned by a live, different wrapper process is skipped —
+        this process claims the next slot and launches its own Chrome."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session")
+
+        foreign_owner_pid = os.getppid()  # a real, live PID that isn't us
+        save_state(
+            _make_session_state(
+                session_id="eng-session",
+                pid=os.getpid(),
+                port=9300,
+                owner_pid=foreign_owner_pid,
+            )
+        )
+
+        fake_proc = mock.MagicMock(spec=subprocess.Popen)
+        fake_proc.pid = 24680
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.find_free_port", return_value=9401
+            ),
+            mock.patch("chrome_wrapper_plugin.server.seed_profile"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.launch_chrome", return_value=fake_proc
+            ) as mock_launch,
+            mock.patch("chrome_wrapper_plugin.server.wait_for_cdp"),
+            mock.patch("tempfile.mkdtemp", return_value=str(tmp_path / "udd")),
+            mock.patch.object(CDPSession, "__init__", return_value=None),
+            mock.patch.object(CDPSession, "connect", return_value=None),
+            mock.patch("chrome_wrapper_plugin.server._attach_buffers"),
+        ):
+            engine = _get_engine()
+
+        mock_launch.assert_called_once()
+        assert engine.proc is not None
+        assert engine.session_id == "eng-session-2"
+
+    def test_launch_failure_removes_placeholder(self, tmp_path, monkeypatch):
+        """A failure anywhere in the fresh-launch path must drop the claimed
+        slot (the reservation placeholder) rather than leaving it stuck."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session-launch-fail")
+
+        # Use a REAL mkdtemp (rooted under tmp_path) rather than a plain
+        # return_value mock, so a real directory exists on disk that the
+        # cleanup path either does or does not remove.
+        real_mkdtemp = tempfile.mkdtemp
+        created: list[str] = []
+
+        def _real_mkdtemp_under_tmp_path(prefix=None, **kwargs):
+            d = real_mkdtemp(prefix=prefix, dir=str(tmp_path))
+            created.append(d)
+            return d
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.find_free_port", return_value=9401
+            ),
+            mock.patch("chrome_wrapper_plugin.server.seed_profile"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.launch_chrome",
+                side_effect=RuntimeError("chrome.exe failed to start"),
+            ),
+            mock.patch("tempfile.mkdtemp", side_effect=_real_mkdtemp_under_tmp_path),
+        ):
+            with pytest.raises(RuntimeError, match="chrome.exe failed to start"):
+                _get_engine()
+
+        assert server_module._engine is None
+        assert load_state("eng-session-launch-fail") is None
+        assert not (tmp_path / "instances" / "eng-session-launch-fail.json").exists()
+        assert len(created) == 1
+        assert not Path(created[0]).exists(), (
+            "user_data_dir must be removed even though launch_chrome() raised "
+            "before `proc` was ever assigned (proc stays None the whole way "
+            "through) — gating cleanup on `proc is not None` leaks this dir."
+        )
+
+    def test_seed_profile_failure_removes_user_data_dir(self, tmp_path, monkeypatch):
+        """If seed_profile() raises (proc is never assigned at all — launch_chrome
+        is never even called), the already-created user_data_dir must still be
+        cleaned up.
+
+        Pre-fix RED: the except-block in _get_engine() gated cleanup on
+        `proc is not None`. Here proc is None the entire time (seed_profile
+        raises before `launch_chrome()` runs), so terminate_chrome() was never
+        called and the temp dir was left on disk — this assertion fails on the
+        unfixed code.
+        """
+        monkeypatch.setenv("CLAUDE_PLUGIN_DATA", str(tmp_path))
+        monkeypatch.setenv("CLAUDE_SESSION_ID", "eng-session-seed-fail")
+
+        real_mkdtemp = tempfile.mkdtemp
+        created: list[str] = []
+
+        def _real_mkdtemp_under_tmp_path(prefix=None, **kwargs):
+            d = real_mkdtemp(prefix=prefix, dir=str(tmp_path))
+            created.append(d)
+            return d
+
+        with (
+            mock.patch("chrome_wrapper_plugin.server.reap_orphans"),
+            mock.patch(
+                "chrome_wrapper_plugin.server.find_free_port", return_value=9402
+            ),
+            mock.patch(
+                "chrome_wrapper_plugin.server.seed_profile",
+                side_effect=RuntimeError("seed copy failed"),
+            ),
+            mock.patch("chrome_wrapper_plugin.server.launch_chrome") as mock_launch,
+            mock.patch("tempfile.mkdtemp", side_effect=_real_mkdtemp_under_tmp_path),
+        ):
+            with pytest.raises(RuntimeError, match="seed copy failed"):
+                _get_engine()
+            mock_launch.assert_not_called()
+
+        assert server_module._engine is None
+        assert load_state("eng-session-seed-fail") is None
+        assert len(created) == 1
+        assert not Path(created[0]).exists(), (
+            "user_data_dir must be removed when seed_profile() raises before "
+            "proc is ever assigned; gating cleanup on `proc is not None` leaks "
+            "this dir."
+        )
+
+
+# ── lifespan / get_instance_info slot-awareness ───────────────────────────────
+
+def test_lifespan_deletes_claimed_slot_state():
+    """_lifespan teardown deletes the state file for the CLAIMED slot, not
+    resolve_session_id()'s base id.  Regression pin: guards against a future
+    change back to delete_state(resolve_session_id())."""
+    import asyncio
+
+    engine = _fake_engine(session_id="eng-session-2")
+    engine.session = mock.MagicMock()
+    server_module._engine = engine
+
+    async def _run():
+        async with server_module._lifespan(None):
+            pass
+
+    with (
+        mock.patch("chrome_wrapper_plugin.server.terminate_chrome"),
+        mock.patch("chrome_wrapper_plugin.server.delete_state") as mock_delete,
+        mock.patch(
+            "chrome_wrapper_plugin.server.resolve_session_id",
+            return_value="eng-session",
+        ),
+    ):
+        asyncio.run(_run())
+
+    mock_delete.assert_called_once_with("eng-session-2")
+    assert server_module._engine is None
+
+
+def test_get_instance_info_uses_slot_session_id():
+    """get_instance_info()'s load_state(engine.session_id) resolves the
+    CLAIMED (possibly suffixed) slot, not the unsuffixed base id."""
+    engine = _fake_engine(proc=None, port=9333, session_id="eng-session-2")
+    saved = _make_session_state(session_id="eng-session-2", pid=77777)
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(
+            server_module, "load_state", return_value=saved
+        ) as mock_load,
+        mock.patch.object(
+            server_module, "find_chrome_hwnd", return_value=(None, None)
+        ) as mock_hwnd,
+    ):
+        get_instance_info()
+
+    mock_load.assert_called_once_with("eng-session-2")
+    mock_hwnd.assert_called_once_with(77777)
