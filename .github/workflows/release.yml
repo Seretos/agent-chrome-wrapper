@@ -270,6 +270,13 @@ jobs:
           # Stash staging + zip outside the worktree before `checkout --orphan`
           # wipes everything.
           TMP=$(mktemp -d)
+                    # .gitattributes MUST ship on the orphan release branch: Claude Code clones it,
+          # and on a Windows machine with core.autocrlf=true (Git-for-Windows default)
+          # a checkout without `* text=auto eol=lf` writes CRLF into the plugin cache —
+          # and Claude Code silently ignores CRLF skills/agents. (Rebuild incident 2026-08-23.)
+          for ga in .gitattributes stamped/.gitattributes; do
+            if [ -f "$ga" ]; then cp -a "$ga" "$STAGE/"; break; fi
+          done
           cp -a "$STAGE"/. "$TMP/"
           ASSET_DIR=$(mktemp -d)
           cp "$ZIP" "$ASSET_DIR/"
