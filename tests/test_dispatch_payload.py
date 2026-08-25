@@ -110,6 +110,251 @@ def _fetch_step(path):
     return _find_step(path, JOB_NAME[path], FETCH_STEP_NAME)
 
 
+def _fold_continuation_lines_with_sources(text):
+    """Like `_join_continuation_lines`, but also returns, for each returned
+    logical line, the (start_index, end_index) span (indexes into
+    `text.splitlines()`) of the physical lines it was folded from --
+    `start_index` is the FIRST physical line, `end_index` the LAST
+    (identical for a line that folded with nothing). `_direct_redirect_lines`
+    checks `end_index` to see whether, by the time the physical line
+    carrying the actual redirect text was reached, an unclosed
+    `$(...)`/backtick wrapper was already open -- information the folded
+    text alone can't carry, since folding only merges backslash-
+    continuations and a wrapper's opening character need not be
+    backslash-continued into the line(s) it wraps. `end_index` (not
+    `start_index`) is the one that matters: a wrapper opener can itself
+    begin on the fold's own first physical line (e.g. split across a
+    continuation boundary) and only become "unclosed as of" a later
+    physical line within the very same fold -- checking `start_index` alone
+    would miss that, since by definition nothing precedes a fold's own
+    first line.
+
+    Continuation semantics (shell-accurate): a physical line is folded into
+    the next one only when its LITERAL LAST CHARACTER (before the line
+    ending) is `\\` -- a backslash followed by trailing whitespace is NOT a
+    continuation in real bash, and is therefore NOT folded here either.
+    Chains of 3+ physical lines fold into a single logical line.
+
+    Whitespace: the following line's content is preserved as-is, including
+    its own leading indentation -- joining does NOT strip the continuation
+    line's indentation before appending it (a deliberate, documented choice).
+
+    Terminal-backslash contract: if the LAST physical line ends in a
+    trailing backslash with nothing left to fold into, the backslash is
+    stripped and the line is still emitted, unfolded -- no exception, no
+    dropped line, no dangling `\\` in the returned string.
+
+    `""` returns `[]`.
+    """
+    if text == "":
+        return []
+    physical_lines = text.splitlines()
+    logical_lines = []
+    buffer = None
+    buffer_start = None
+    buffer_end = None
+    for index, line in enumerate(physical_lines):
+        if line.endswith("\\"):
+            folded = line[:-1]
+            if buffer is None:
+                buffer = folded
+                buffer_start = index
+            else:
+                buffer = buffer + " " + folded
+            buffer_end = index
+        else:
+            if buffer is None:
+                logical_lines.append((line, index, index))
+            else:
+                logical_lines.append((buffer + " " + line, buffer_start, index))
+                buffer = None
+                buffer_start = None
+                buffer_end = None
+    if buffer is not None:
+        # Terminal backslash with nothing left to fold into -- still
+        # emitted, unfolded, no dangling backslash.
+        logical_lines.append((buffer, buffer_start, buffer_end))
+    return logical_lines
+
+
+def _join_continuation_lines(text):
+    """Fold shell backslash line-continuations into logical lines.
+
+    See `_fold_continuation_lines_with_sources` for the full contract; this
+    is that function with the per-logical-line source span dropped, kept
+    as the plain string-list interface existing callers/tests use.
+    """
+    return [line for line, _, _ in _fold_continuation_lines_with_sources(text)]
+
+
+def _wrapper_open_before_lines(run_text):
+    """For each physical line of `run_text.splitlines()` (by index), whether
+    that line begins already inside an unclosed `$(...)` command
+    substitution or an unclosed backtick pair opened earlier in `run_text`.
+
+    A SINGLE pass over the FULL `run_text` string (round 2 fix) -- not
+    `run_text.splitlines()` scanned line-by-line in isolation -- tracking
+    `$(`/`)` paren-depth, backtick parity, single-/double-quote state and
+    `#`-comment state together, character by character, so state carries
+    correctly across physical-line boundaries. This structurally closes two
+    round-2 review findings at once:
+
+    - A wrapper opener whose two characters (`$` and `(`) land on different
+      physical lines -- e.g. because a backslash-continuation sits between
+      them -- is still recognized as one atomic opener, the same way real
+      bash splices a `\\\\\n` away before tokenizing (this is the mirror
+      image of `_join_continuation_lines`'s already-established
+      continuation folding: there the split was in the INVOCATION, here it
+      is in the WRAPPER's own opening token). A per-physical-line scan
+      bounded by each line's own length can never see this, since the
+      second character never appears within the first line's own index
+      range.
+    - `$(`/backtick appearing inside a `'single-quoted'` string, or after an
+      unescaped `#` comment marker, has NO special meaning and does not
+      affect the tracked depth/parity -- matching real bash. A `$(`/backtick
+      inside a `"double-quoted"` string RETAINS its special meaning (bash
+      still performs command substitution inside double quotes), so
+      double-quoted regions are scanned for `$(`/`)`/backtick exactly like
+      bare, unquoted text; only `"` itself behaves differently there (it
+      CLOSES the region instead of opening one, and `#` does not start a
+      comment). A backslash (outside single quotes, including inside double
+      quotes) escapes the next character for exactly one character, EXCEPT
+      when that next character is a newline -- that's a shell
+      line-continuation instead: no state toggle of its own, but the
+      newline is still a real physical-line boundary (`run_text.splitlines()`
+      still treats it as a new physical line), so it still gets its own
+      `open_before` entry.
+
+    Deliberately unhandled, documented simplifications (not needed for
+    these workflows' simple `run:` blocks): here-docs (`<<`), ANSI-C
+    quoting (`$'...'`), a `\\\n` continuation occurring *inside* a
+    single-quoted string (real bash: not a continuation there, still two
+    literal characters -- this scanner does not special-case that
+    pathological overlap), and other exotic shell lexing. Comment state is
+    reset at every `\n` crossed -- continuation or plain -- a simpler,
+    deliberately chosen behaviour rather than modelling comment survival
+    across a spliced line.
+    """
+    depth = 0
+    backtick_open = False
+    in_single = False
+    in_double = False
+    in_comment = False
+    open_before = [depth > 0 or backtick_open]
+    i = 0
+    n = len(run_text)
+    while i < n:
+        ch = run_text[i]
+
+        if ch == "\n":
+            in_comment = False
+            open_before.append(depth > 0 or backtick_open)
+            i += 1
+            continue
+
+        if in_single:
+            # Fully literal in here: only a closing `'` has any meaning.
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_comment:
+            i += 1
+            continue
+
+        if ch == "\\" and i + 1 < n and run_text[i + 1] == "\n":
+            # Line continuation: no state toggle of its own, but the
+            # newline is still a real physical-line boundary.
+            open_before.append(depth > 0 or backtick_open)
+            i += 2
+            continue
+
+        if ch == "\\":
+            # Escapes the next character for exactly one character (outside
+            # single quotes, including inside double quotes).
+            i += 2 if i + 1 < n else 1
+            continue
+
+        if not in_double:
+            if ch == "'":
+                in_single = True
+                i += 1
+                continue
+            if ch == '"':
+                in_double = True
+                i += 1
+                continue
+            if ch == "#":
+                in_comment = True
+                i += 1
+                continue
+        elif ch == '"':
+            in_double = False
+            i += 1
+            continue
+
+        # Common `$(` / `)` / backtick handling -- identical whether bare
+        # or inside a double-quoted string.
+        if ch == "$":
+            # Look past any backslash-newline continuation(s) spliced
+            # between `$` and `(`, so a wrapper opener split across a
+            # continuation boundary is still recognized as one token.
+            j = i + 1
+            skipped_newlines = 0
+            while j + 1 < n and run_text[j] == "\\" and run_text[j + 1] == "\n":
+                j += 2
+                skipped_newlines += 1
+            if j < n and run_text[j] == "(":
+                depth += 1
+                for _ in range(skipped_newlines):
+                    open_before.append(depth > 0 or backtick_open)
+                i = j + 1
+                continue
+        elif ch == ")" and depth > 0:
+            depth -= 1
+        elif ch == "`":
+            backtick_open = not backtick_open
+
+        i += 1
+
+    physical_line_count = len(run_text.splitlines())
+    return open_before[:physical_line_count]
+
+
+def _direct_redirect_lines(run_text):
+    """Return every logical line (continuations folded) that co-occurs a
+    `gh release view` invocation and a direct `> "$CHANGELOG_FILE"`
+    redirect.
+
+    Applies NO guards beyond that co-occurrence check plus one exception:
+    a logical line is excluded if, by the time the physical line it ENDS on
+    was reached, that line was already inside an unclosed `$(...)`/backtick
+    wrapper -- that's the signature of a command-substitution round-trip
+    whose invocation and redirect were folded onto the same logical line by
+    coincidence of backslash-continuation, not because the redirect is
+    actually direct. Checking the fold's END index (not its start) is what
+    catches a wrapper opener that begins on the fold's own first physical
+    line (e.g. split across a continuation boundary, see
+    `_wrapper_open_before_lines`) and only becomes unclosed-as-of a later
+    physical line within that same fold -- the start index alone is always
+    `False` there, since nothing precedes a fold's own first line. In
+    particular this function still does NOT reject a `$(` or backtick that
+    appears WITHIN the returned line's own text (that guard stays the
+    caller's responsibility, exactly as it is today in
+    `test_fetch_step_redirects_gh_stdout_to_changelog_file`).
+    """
+    open_before = _wrapper_open_before_lines(run_text)
+    result = []
+    for line, start_index, end_index in _fold_continuation_lines_with_sources(run_text):
+        if "gh release view" not in line or '> "$CHANGELOG_FILE"' not in line:
+            continue
+        if end_index is not None and open_before[end_index]:
+            continue
+        result.append(line)
+    return result
+
+
 def _step_index(path, job_name, step_name):
     workflow = _load_workflow(path)
     jobs = workflow["jobs"]
@@ -383,25 +628,24 @@ def test_fetch_step_redirects_gh_stdout_to_changelog_file(workflow):
         f'"$CHANGELOG_FILE" in the {FETCH_STEP_NAME!r} step of {workflow}, '
         f"got run text: {run_text!r}"
     )
-    # The invocation and its redirect must co-occur on the SAME line: any
-    # command-substitution wrapper (single- or multi-line, e.g.
-    # `BODY=$(gh release view ...)` or a multi-line `BODY=$(\n  gh release
-    # view ...\n)`) necessarily separates the invocation from a direct
-    # `> "$CHANGELOG_FILE"` redirect onto different lines (or removes the
-    # direct redirect from the invocation's line entirely), so requiring
-    # same-line co-occurrence is what actually pins down "no round-trip
-    # through a variable" -- checking `gh release view` lines and the
-    # `> "$CHANGELOG_FILE"` redirect's presence in the step independently
-    # (as before) is satisfied by a multi-line command substitution whose
-    # redirect lives elsewhere in the step.
-    direct_redirect_lines = [
-        line
-        for line in run_text.splitlines()
-        if "gh release view" in line and '> "$CHANGELOG_FILE"' in line
-    ]
+    # The invocation and its redirect must co-occur on the SAME logical line
+    # (continuations folded): any command-substitution wrapper (single- or
+    # multi-line, e.g. `BODY=$(gh release view ...)` or a multi-line
+    # `BODY=$(\n  gh release view ...\n)`) necessarily separates the
+    # invocation from a direct `> "$CHANGELOG_FILE"` redirect onto different
+    # lines (or removes the direct redirect from the invocation's line
+    # entirely), so requiring same-logical-line co-occurrence is what
+    # actually pins down "no round-trip through a variable" -- checking
+    # `gh release view` lines and the `> "$CHANGELOG_FILE"` redirect's
+    # presence in the step independently (as before) is satisfied by a
+    # multi-line command substitution whose redirect lives elsewhere in the
+    # step. `_direct_redirect_lines` folds backslash line-continuations
+    # first, so a `gh release view ... \` + continuation-line redirect that
+    # is behaviourally a single shell command is still recognized.
+    direct_redirect_lines = _direct_redirect_lines(run_text)
     assert direct_redirect_lines, (
         f"expected a `gh release view` invocation and its "
-        f'`> "$CHANGELOG_FILE"` redirect on the SAME line in the '
+        f'`> "$CHANGELOG_FILE"` redirect on the SAME logical line in the '
         f"{FETCH_STEP_NAME!r} step of {workflow} -- a command substitution "
         "(single- or multi-line) that round-trips gh's stdout through a "
         "variable before redirecting it elsewhere would put the invocation "
@@ -422,6 +666,240 @@ def test_fetch_step_redirects_gh_stdout_to_changelog_file(workflow):
     assert dispatch_env.get("CHANGELOG_FILE") == changelog_var, (
         "expected the fetch step's redirection target to be the same "
         "CHANGELOG_FILE env var the dispatch step consumes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ticket #34 (revision 2) -- harden the direct-redirect heuristic above so a
+# backslash-continued (but behaviourally identical) `gh release view ... >
+# "$CHANGELOG_FILE"` invocation is still recognized, without weakening the
+# anti-round-trip guard against a multi-line `$(...)` command substitution.
+#
+# `_join_continuation_lines` / `_direct_redirect_lines` do not exist yet --
+# these two driving tests are expected to fail with a NameError until
+# phase=implement adds them.
+# ---------------------------------------------------------------------------
+
+def test_direct_redirect_lines_folds_backslash_continuation():
+    # The real fetch command, split after `--json body` with a trailing
+    # backslash continuation -- behaviourally identical to the single-line
+    # form, and must still be recognized as a direct redirect.
+    run_text = (
+        'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body \\\n'
+        "  -q '.body // empty' > \"$CHANGELOG_FILE\" 2>/dev/null || true\n"
+    )
+    result = _direct_redirect_lines(run_text)
+    assert len(result) == 1, (
+        f"expected the two continuation-joined physical lines to fold into "
+        f"exactly one logical line, got {result!r}"
+    )
+    # Built from three explicit pieces to show exactly where the join
+    # inserts its one space: the folded first line (which keeps its own
+    # trailing space from before the stripped backslash) + the join
+    # separator + the continuation line verbatim (including its own
+    # leading indentation, per the documented no-strip contract).
+    expected_joined = (
+        'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        + " "
+        + "  -q '.body // empty' > \"$CHANGELOG_FILE\" 2>/dev/null || true"
+    )
+    assert result[0] == expected_joined, (
+        f"expected the folded logical line to be the exact single-space-"
+        f"joined text with no trailing backslash, got {result[0]!r}"
+    )
+
+
+def test_direct_redirect_lines_rejects_multiline_command_substitution():
+    # A multi-line `$(...)` command substitution that round-trips gh's
+    # stdout through a variable before redirecting it elsewhere -- no
+    # trailing backslashes involved, so an over-eager folding implementation
+    # (e.g. one that joins on `$(`...`)` balance rather than on trailing
+    # `\`) would wrongly recognize this as a direct redirect.
+    run_text = (
+        "BODY=$(\n"
+        '  gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        "-q '.body // empty'\n"
+        ")\n"
+        "printf '%s' \"$BODY\" > \"$CHANGELOG_FILE\"\n"
+    )
+    assert _direct_redirect_lines(run_text) == [], (
+        "expected no logical line to co-occur 'gh release view' and "
+        '\'> "$CHANGELOG_FILE"\' when they are separated by a multi-line '
+        "command substitution"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ticket #34 (revision 2) -- edge-case coverage for `_join_continuation_lines`
+# / `_direct_redirect_lines`. These may pass immediately once the helpers
+# above exist -- expected and acceptable per the plan (only the two driving
+# tests above need a RED->GREEN transition).
+# ---------------------------------------------------------------------------
+
+def test_join_continuation_lines_folds_chained_continuations():
+    text = "one \\\ntwo \\\nthree\n"
+    assert _join_continuation_lines(text) == ["one  two  three"]
+
+
+def test_join_continuation_lines_keeps_trailing_backslash_final_line():
+    text = "one\ntwo \\"
+    result = _join_continuation_lines(text)
+    assert result == ["one", "two "], (
+        f"expected the last line's trailing backslash to be stripped and the "
+        f"line still emitted, unfolded, got {result!r}"
+    )
+    assert "\\" not in result[-1], (
+        f"expected no dangling backslash in the emitted last line, got "
+        f"{result[-1]!r}"
+    )
+
+
+def test_join_continuation_lines_empty_text():
+    assert _join_continuation_lines("") == []
+
+
+def test_join_continuation_lines_does_not_fold_backslash_then_whitespace():
+    # Real shell semantics: a backslash is only a line continuation when it
+    # is the LITERAL LAST CHARACTER before the newline. A `\` followed by
+    # trailing whitespace is NOT a continuation in real bash -- the line is
+    # not continued, so "one \   " and "two" must remain two separate
+    # logical lines, each preserved verbatim (including "one"'s own
+    # trailing whitespace after the backslash).
+    text = "one \\   \ntwo\n"
+    assert _join_continuation_lines(text) == ["one \\   ", "two"], (
+        "a backslash followed by trailing whitespace is not a real shell "
+        "continuation and must not be folded"
+    )
+
+
+def test_join_continuation_lines_folds_when_backslash_is_the_true_last_character():
+    # Contrast case: the backslash IS the literal last character (no
+    # trailing whitespace after it) -- this is a true continuation and must
+    # still be folded, even though the line has other content before the
+    # backslash.
+    text = "one two\\\nthree\n"
+    assert _join_continuation_lines(text) == ["one two three"]
+
+
+def test_direct_redirect_lines_rejects_backslash_continued_invocation_inside_command_substitution():
+    # Round 3 review finding 1: the wrapper's opener (`BODY=$(`) sits on its
+    # own separate, unfolded physical line (no trailing `\`, so
+    # `_join_continuation_lines` never merges it into the invocation's
+    # logical line). The invocation itself IS backslash-continued, so after
+    # folding, the returned logical line contains neither `$(` nor a
+    # backtick -- the caller's existing `"$(" not in line` guard never sees
+    # the `$(` because it lives on a different (unfolded) line. This is the
+    # already-fixed multi-line-substitution defect class reintroduced
+    # through a new path; `_direct_redirect_lines` must reject it by
+    # tracking wrapper-open state across the full physical-line sequence,
+    # not just within each folded logical line's own text.
+    run_text = (
+        "BODY=$(\n"
+        '  gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body \\\n'
+        "    -q '.body // empty' > \"$CHANGELOG_FILE\"\n"
+        ")\n"
+    )
+    assert _direct_redirect_lines(run_text) == [], (
+        "expected no direct-redirect line when the folded invocation began "
+        "life inside an unclosed $(...) wrapper opened on an earlier, "
+        "unrelated physical line"
+    )
+
+
+def test_direct_redirect_lines_returns_guard_failing_line_unfiltered():
+    # The helper itself applies no $( guard -- that stays the caller's job.
+    # Observable form of the no-guards return contract.
+    run_text = 'gh release view "$TAG" $(echo x) > "$CHANGELOG_FILE"\n'
+    assert _direct_redirect_lines(run_text) == [run_text.rstrip("\n")]
+
+
+def test_direct_redirect_lines_returns_backtick_guard_failing_line_unfiltered():
+    # Backtick counterpart of the `$(` fixture above.
+    run_text = 'gh release view "$TAG" `echo x` > "$CHANGELOG_FILE"\n'
+    assert _direct_redirect_lines(run_text) == [run_text.rstrip("\n")]
+
+
+# ---------------------------------------------------------------------------
+# ticket #34 (revision 2, round 2 fix) -- `_wrapper_open_before_lines` is now
+# a single quote-aware pass over the FULL run_text, replacing round 1's
+# per-physical-line depth/backtick tracker. These tests cover the three
+# round-2 review findings: (1)/(2) a `$(` inside a single-quoted string or a
+# `#` comment must not poison later lines, and (3) the wrapper's own `$(`
+# opener can itself be split across a backslash-continuation boundary. A
+# fourth guards against overcorrecting (1)/(2) into suppressing `$(` inside
+# DOUBLE-quoted strings, where it must still count.
+# ---------------------------------------------------------------------------
+
+def test_wrapper_open_before_ignores_dollar_paren_inside_single_quotes():
+    # Round 2 finding 1: real bash treats everything inside a single-quoted
+    # string as 100% literal -- a `$(` there must not poison the depth
+    # counter for a genuine direct-redirect line that follows.
+    run_text = (
+        "echo 'literal $( not a wrapper'\n"
+        'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        "-q '.body // empty' > \"$CHANGELOG_FILE\"\n"
+    )
+    result = _direct_redirect_lines(run_text)
+    assert len(result) == 1, (
+        "expected the single-quoted `$(` on the earlier line to have no "
+        f"effect on the later genuine direct-redirect line, got {result!r}"
+    )
+    assert "gh release view" in result[0]
+
+
+def test_wrapper_open_before_ignores_dollar_paren_inside_comment():
+    # Round 2 finding 1 (comment variant): a `#`-started comment runs to the
+    # end of the line and its contents (including a stray `$(`) have no
+    # shell meaning -- must not poison a later genuine direct-redirect line.
+    run_text = (
+        "# not $( a wrapper\n"
+        'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        "-q '.body // empty' > \"$CHANGELOG_FILE\"\n"
+    )
+    result = _direct_redirect_lines(run_text)
+    assert len(result) == 1, (
+        "expected the commented-out `$(` on the earlier line to have no "
+        f"effect on the later genuine direct-redirect line, got {result!r}"
+    )
+    assert "gh release view" in result[0]
+
+
+def test_wrapper_open_before_detects_dollar_paren_split_by_continuation():
+    # Round 2 finding 3: the wrapper's own opening `$(` has its two
+    # characters split across a backslash-continuation boundary (`$` ends
+    # the first physical line via `\`, `(` starts the next). Real bash
+    # splices the `\<newline>` away before tokenizing, so this is still one
+    # atomic `$(` opener -- the mirror image of round 1's already-fixed
+    # split-invocation bug, this time in the wrapper's own opening token.
+    # The redirect ends up on the SAME fold as the split opener (the `$\`
+    # ending forces `_join_continuation_lines` to fold the next physical
+    # line into it), so this also exercises that the exclusion check must
+    # look at the fold's END, not its start.
+    run_text = (
+        "BODY=$\\\n"
+        '(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        "-q '.body // empty' > \"$CHANGELOG_FILE\"\n"
+        ")\n"
+    )
+    assert _direct_redirect_lines(run_text) == [], (
+        "expected no direct-redirect line when the wrapper's own opening "
+        "`$(` is itself split across a backslash-continuation boundary"
+    )
+
+
+def test_wrapper_open_before_still_detects_dollar_paren_inside_double_quotes():
+    # Safety net for the fix above: quote-awareness must not overcorrect --
+    # real bash still performs command substitution inside a "double-quoted"
+    # string, so a `$(` there must still count as a real, unclosed opener
+    # and still reject the round-trip.
+    run_text = (
+        'BODY="$(unrelated\n'
+        'gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body '
+        "-q '.body // empty' > \"$CHANGELOG_FILE\"\n"
+    )
+    assert _direct_redirect_lines(run_text) == [], (
+        "expected a `$(` inside a double-quoted string to still count as a "
+        "real wrapper opener and reject the round-trip"
     )
 
 
