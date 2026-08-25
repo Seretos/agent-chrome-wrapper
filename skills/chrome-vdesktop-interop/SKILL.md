@@ -35,3 +35,10 @@ vdesktop.resize_window(handle_id=handle_id, width=1280, height=800)
   again after a short wait if `hwnd` is `None`.
 - `adopt_window` accepts a raw HWND integer directly — no session ID translation needed.
 - All three calls use the same MCP session; no shared state exists between plugins.
+- `info["cdp_alive"]` reports whether this session's Chrome is actually
+  reachable over CDP right now (a short-timeout `Target.getTargetInfo`
+  probe), not just whether the cached pid/port/hwnd look plausible. If
+  `cdp_alive` is `False`, treat `hwnd` as stale before handing it to
+  `adopt_window` — a hand-closed or crashed Chrome can still have a cached
+  hwnd from a previous check. `get_instance_info()` is validate-only here:
+  it does not relaunch or repair Chrome on your behalf.

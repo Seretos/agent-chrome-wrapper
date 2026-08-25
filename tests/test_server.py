@@ -18,7 +18,7 @@ import pytest
 
 import chrome_wrapper_plugin.server as server_module
 import chrome_wrapper_plugin.state as state_module
-from chrome_wrapper_plugin.cdp import CDPSession
+from chrome_wrapper_plugin.cdp import CDPError, CDPSession
 from chrome_wrapper_plugin.server import ChromeEngine, _get_engine, get_instance_info
 from chrome_wrapper_plugin.state import SessionState, load_state, save_state
 
@@ -50,7 +50,8 @@ def test_get_instance_info_keys():
         info = get_instance_info()
 
     assert set(info.keys()) == {
-        "session_id", "pid", "port", "user_data_dir", "profile", "hwnd", "window_title"
+        "session_id", "pid", "port", "user_data_dir", "profile", "hwnd", "window_title",
+        "cdp_alive",
     }
 
 
@@ -158,6 +159,122 @@ def test_get_instance_info_no_saved_state_profile_is_none():
     assert info["profile"] is None
     assert info["hwnd"] is None
     assert info["window_title"] is None
+
+
+# ── get_instance_info: cdp_alive (ticket #29) ─────────────────────────────────
+
+def test_get_instance_info_cdp_alive_true_when_probe_succeeds():
+    """A reachable Chrome (Target.getTargetInfo round-trip succeeds) reports
+    cdp_alive: True, and the probe uses the module's short probe timeout."""
+    mock_session = mock.MagicMock(spec=CDPSession)
+    mock_session.send.return_value = {"targetInfo": {"url": "about:blank"}}
+    engine = _fake_engine(session=mock_session)
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["cdp_alive"] is True
+    # Pin the literal expected value rather than referencing
+    # server_module._CDP_PROBE_TIMEOUT — this would fail if the module
+    # constant were ever changed to something other than 2.0.
+    mock_session.send.assert_called_once_with(
+        "Target.getTargetInfo", {}, timeout=2.0
+    )
+
+
+def test_get_instance_info_cdp_alive_false_when_probe_raises():
+    """An unreachable Chrome (probe raises) reports cdp_alive: False, and the
+    tool never raises — other keys are still present in the returned dict."""
+    mock_session = mock.MagicMock(spec=CDPSession)
+    mock_session.send.side_effect = TimeoutError("CDP 'Target.getTargetInfo' timed out after 2.0s")
+    engine = _fake_engine(session=mock_session)
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["cdp_alive"] is False
+    # The probe failure must be validate-only: the rest of the record keeps
+    # the real values supplied by the fake engine/state, not blanked to None.
+    assert info["session_id"] == "test-session"
+    assert info["pid"] is None
+    assert info["port"] == 9222
+    assert info["user_data_dir"] == str(Path("/tmp/udd"))
+    assert info["profile"] is None
+    assert info["hwnd"] is None
+    assert info["window_title"] is None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError("timed out"),
+        ConnectionError("connection reset"),
+        OSError("socket error"),
+        AssertionError("CDPSession.send() called before connect()"),
+        TypeError("argument of type 'NoneType' is not iterable"),
+        KeyError("code"),
+        RuntimeError("torn down"),
+    ],
+)
+def test_get_instance_info_cdp_alive_false_for_any_probe_exception(exc):
+    """Any non-CDPError exception raised by the probe yields cdp_alive: False,
+    never propagates out of get_instance_info(), for every raise path
+    documented in the plan (TimeoutError, the assert in send(), whatever
+    websocket-client raises, TypeError/KeyError from a malformed frame, and
+    an arbitrary RuntimeError)."""
+    mock_session = mock.MagicMock(spec=CDPSession)
+    mock_session.send.side_effect = exc
+    engine = _fake_engine(session=mock_session)
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["cdp_alive"] is False
+
+
+def test_get_instance_info_cdp_alive_true_on_cdp_error():
+    """A CDP protocol-level error (Chrome answered, just rejected the call)
+    still counts as alive — pins that `except CDPError` is checked before the
+    broader `except Exception` clause."""
+    mock_session = mock.MagicMock(spec=CDPSession)
+    mock_session.send.side_effect = CDPError("-32000: No such target")
+    engine = _fake_engine(session=mock_session)
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["cdp_alive"] is True
+
+
+def test_get_instance_info_cdp_alive_false_when_no_session():
+    """No CDPSession attached (session is None) means dead, with no probe
+    attempted and no exception raised."""
+    engine = _fake_engine()  # default session=None
+
+    with (
+        mock.patch.object(server_module, "_get_engine", return_value=engine),
+        mock.patch.object(server_module, "load_state", return_value=None),
+        mock.patch.object(server_module, "find_chrome_hwnd", return_value=(None, None)),
+    ):
+        info = get_instance_info()
+
+    assert info["cdp_alive"] is False
 
 
 # ── _get_engine lifecycle ─────────────────────────────────────────────────────

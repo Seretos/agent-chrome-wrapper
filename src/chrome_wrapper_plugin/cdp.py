@@ -147,7 +147,7 @@ class CDPSession:
         with self._id_lock:
             self._pending.clear()
 
-    def send(self, method: str, params: dict | None = None) -> dict:
+    def send(self, method: str, params: dict | None = None, timeout: float | None = None) -> dict:
         """Send a CDP command and return the result dict.
 
         Parameters
@@ -156,6 +156,13 @@ class CDPSession:
             CDP method, e.g. ``"Page.navigate"``.
         params:
             Optional parameters dict.
+        timeout:
+            Per-call override for how long to wait for a reply, in seconds.
+            ``None`` (the default) means "inherit the session default" set at
+            construction time — this is distinct from the constructor's own
+            ``timeout=None``, which is rejected outright. Pass an explicit
+            float here to wait for a different duration than the session
+            default for this one call (e.g. a short liveness probe).
 
         Returns
         -------
@@ -169,6 +176,8 @@ class CDPSession:
         CDPError
             If Chrome returns an ``"error"`` field.
         """
+        effective_timeout = self._timeout if timeout is None else float(timeout)
+
         with self._id_lock:
             self._next_id += 1
             msg_id = self._next_id
@@ -180,11 +189,11 @@ class CDPSession:
         assert self._ws is not None, "CDPSession.send() called before connect()"
         self._ws.send(payload)
 
-        if not event.wait(timeout=self._timeout):
+        if not event.wait(timeout=effective_timeout):
             with self._id_lock:
                 self._pending.pop(msg_id, None)
             raise TimeoutError(
-                f"CDP {method!r} timed out after {self._timeout}s"
+                f"CDP {method!r} timed out after {effective_timeout}s"
             )
 
         msg = result_holder[0]
