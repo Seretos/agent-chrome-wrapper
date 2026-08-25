@@ -332,37 +332,75 @@ jobs:
             ${{ contains(inputs.version, '-') && '--prerelease' || '' }} \
             "${{ steps.rel.outputs.asset }}"
 
+      - name: Fetch changelog for dispatch
+        shell: bash
+        env:
+          GH_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          TAG:            ${{ needs.stamp.outputs.tag }}
+          CHANGELOG_FILE: ${{ runner.temp }}/changelog.md
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q '.body // empty' > "$CHANGELOG_FILE" 2>/dev/null || true
+
       # Tags created via GITHUB_TOKEN don't fire downstream push:tags workflows
       # (Actions blocks this to prevent recursive loops). Call the marketplace
       # directly with a separate PAT.
       - name: Dispatch to agent-marketplace
         shell: bash
         env:
-          GH_PAT:  ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
-          VERSION: ${{ inputs.version }}
-          NAME:    ${{ needs.stamp.outputs.plugin_name }}
-          TAG:     ${{ needs.stamp.outputs.tag }}
-          DESC:    ${{ needs.stamp.outputs.description }}
+          GH_PAT:         ${{ secrets.MARKETPLACE_DISPATCH_TOKEN }}
+          VERSION:        ${{ inputs.version }}
+          NAME:           ${{ needs.stamp.outputs.plugin_name }}
+          TAG:            ${{ needs.stamp.outputs.tag }}
+          DESC:           ${{ needs.stamp.outputs.description }}
+          REPO:           ${{ github.repository }}
+          CHANGELOG_FILE: ${{ runner.temp }}/changelog.md
+          PAYLOAD_FILE:   ${{ runner.temp }}/payload.json
         run: |
           # DESC comes from the stamp job's output (env above); the stamped/
           # tree it used to be read from no longer exists at this point —
           # `git clean -fdx` in the release-branch step removed it.
+          python3 - <<'PY'
+          import json, os
+
+          changelog_file = os.environ["CHANGELOG_FILE"]
+          body = ""
+          if os.path.exists(changelog_file):
+              with open(changelog_file, "r", encoding="utf-8", newline="") as fh:
+                  body = fh.read()
+
+          TRUNCATE_LIMIT = 30000
+          repo = os.environ["REPO"]
+          tag = os.environ["TAG"]
+
+          client_payload = {
+              "name": os.environ["NAME"],
+              "description": os.environ["DESC"],
+              "repo": repo,
+              "category": "mcp",
+              "version": os.environ["VERSION"],
+              "ref": tag,
+              "icon": f"https://raw.githubusercontent.com/{repo}/{tag}/assets/icon.png",
+              "description_url": f"https://raw.githubusercontent.com/{repo}/{tag}/description.md",
+          }
+
+          if body.strip():
+              encoded = body.encode("utf-8")
+              if len(encoded) > TRUNCATE_LIMIT:
+                  truncated = encoded[:TRUNCATE_LIMIT].decode("utf-8", "ignore")
+                  body = truncated + f"\n\n_… truncated. Full release notes: https://github.com/{repo}/releases/tag/{tag}_"
+              client_payload["changelog"] = body
+          else:
+              print(f"::warning::No release body found for {tag}; dispatching without a changelog.")
+
+          with open(os.environ["PAYLOAD_FILE"], "w", encoding="utf-8") as fh:
+              json.dump(
+                  {"event_type": "plugin-release", "client_payload": client_payload},
+                  fh,
+                  ensure_ascii=False,
+              )
+          PY
           curl -fsSL -X POST \
             -H "Authorization: Bearer $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/Seretos/agent-marketplace/dispatches \
-            -d @- <<EOF
-          {
-            "event_type": "plugin-release",
-            "client_payload": {
-              "name":        "${NAME}",
-              "description": "${DESC}",
-              "repo":        "${{ github.repository }}",
-              "category":    "mcp",
-              "version":     "${VERSION}",
-              "ref":         "${TAG}",
-              "icon":        "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/assets/icon.png",
-              "description_url": "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/description.md"
-            }
-          }
-          EOF
+            -d @"$PAYLOAD_FILE"
