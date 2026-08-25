@@ -60,6 +60,7 @@ def _send_recv(proc: subprocess.Popen, msg: dict) -> dict:
     raise TimeoutError(f"No response within 30 s for id={msg.get('id')!r}")
 
 
+@pytest.mark.timeout(180)
 def test_navigate_and_screenshot():
     """Frozen binary: initialize -> navigate to example.com -> screenshot returns PNG image."""
     proc = subprocess.Popen(

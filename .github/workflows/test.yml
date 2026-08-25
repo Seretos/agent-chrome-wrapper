@@ -1,15 +1,17 @@
 name: tests
 
-# Runs pytest on every push to any branch and on every PR. Distinct from
-# release.yml, which is workflow_dispatch-driven and produces the OS-specific
-# binaries / release zip.
+# Runs pytest on every pull request. Distinct from release.yml, which is
+# workflow_dispatch-driven and produces the OS-specific binaries / release zip.
+#
+# Pull-request-only on purpose (#33): a branch that already has an open PR
+# would otherwise produce two identical runs for the same commit. Merges into
+# main stay gated by the branch-protection rule that requires this `tests`
+# check.
 #
 # This plugin is Windows-only (it launches and manages local Chrome instances
 # and is intended to pair with agent-vdesktop on a Windows host), so the test
 # matrix runs Windows-only.
 on:
-  push:
-    branches: ["**"]
   pull_request:
 
 permissions:
