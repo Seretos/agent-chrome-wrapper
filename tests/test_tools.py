@@ -1770,7 +1770,13 @@ class TestWaitForNetworkIdle:
             wait_for_network_idle()
             elapsed = time.monotonic() - start
 
-        assert elapsed >= 0.05, elapsed
+        # On windows-latest CI, time.sleep(0.05) has been observed to return
+        # ~3ms early due to timer/scheduler granularity; a 10% tolerance
+        # (>= 0.045) absorbs that while still catching an implementation
+        # that delivers meaningfully less than the intended settle duration,
+        # and clearly distinguishes a real ~50ms sleep from an Event.wait-
+        # based settle, which would fire near-instantly (~0ms).
+        assert elapsed >= 0.05 * 0.9, elapsed
 
     def test_requests_seen_counts_total_requests_not_just_in_flight(self):
         """#41.2: requests_seen must be a monotonically increasing total
