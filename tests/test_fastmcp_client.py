@@ -96,8 +96,10 @@ def test_server_mcp_is_fastmcp_2x_instance():
 
 def test_registered_tools_match_ast_derived_set():
     expected = _ast_derived_tool_names()
-    assert len(expected) == 18, (
-        f"AST-derived tool set has {len(expected)} names, expected 18: "
+    # 19 (#41.1): get_element_info() is new module-level tool function,
+    # bumping the AST-derived set from 18.
+    assert len(expected) == 19, (
+        f"AST-derived tool set has {len(expected)} names, expected 19: "
         f"{sorted(expected)}"
     )
 
@@ -110,7 +112,7 @@ def test_registered_tools_match_ast_derived_set():
         "registered tool set does not match the AST-derived expectation; "
         f"missing={sorted(missing)} extra={sorted(extra)}"
     )
-    assert len(actual) == 18
+    assert len(actual) == 19
 
 
 # ── R3: tool metadata sampled via the real client ──────────────────────────
@@ -199,8 +201,15 @@ def test_dict_returning_tool_yields_json_text_content():
 # ── R4: screenshot wire format ─────────────────────────────────────────────
 
 def test_screenshot_returns_image_content_block():
+    """#41.3: screenshot() now returns [Image, metadata], a breaking change
+    from the bare Image return. Over the wire this must still surface a
+    type=="image" content block, PLUS a new type=="text" block carrying the
+    metadata as JSON (width/height/url/title). engine.session.send now needs
+    two distinct replies — Page.captureScreenshot then Target.getTargetInfo —
+    so return_value is replaced with a two-element side_effect list."""
     import asyncio
     import base64
+    import json
     from pathlib import Path as _Path
     from unittest import mock
 
@@ -217,9 +226,10 @@ def test_screenshot_returns_image_content_block():
         session_id="test-session",
     )
     engine.session = mock.MagicMock()
-    engine.session.send.return_value = {
-        "data": base64.b64encode(png_bytes).decode()
-    }
+    engine.session.send.side_effect = [
+        {"data": base64.b64encode(png_bytes).decode()},
+        {"targetInfo": {"url": "http://example.test", "title": "Example"}},
+    ]
 
     async def _run():
         async with fastmcp.Client(server_module.mcp) as client:
@@ -234,3 +244,9 @@ def test_screenshot_returns_image_content_block():
     block = image_blocks[0]
     assert block.mimeType == "image/png"
     assert base64.b64decode(block.data) == png_bytes
+
+    text_blocks = [b for b in blocks if getattr(b, "type", None) == "text"]
+    assert text_blocks, f"no type=='text' content block (screenshot metadata) in {blocks!r}"
+    metadata = json.loads(text_blocks[0].text)
+    assert metadata["url"] == "http://example.test"
+    assert metadata["title"] == "Example"

@@ -13,7 +13,7 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import FastMCP
 from fastmcp.tools import Tool
@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # cheap round-trip check, not a real CDP call, so it should fail fast
 # rather than wait for the session's normal (30s) default.
 _CDP_PROBE_TIMEOUT = 2.0
+
+# Grace period wait_for_network_idle() sleeps before evaluating idleness, to
+# catch requests that arrive just after the listeners are registered. Read
+# live via the module attribute inside the function body (never captured as
+# a default argument) so tests can monkeypatch it and see the new value take
+# effect immediately.
+_NETWORK_IDLE_SETTLE = 0.3
 
 
 @asynccontextmanager
@@ -337,7 +344,26 @@ def get_page_info() -> dict:
     }
 
 
-def screenshot(full_page: bool = False) -> Image:
+def _png_dimensions(data: bytes) -> tuple[int | None, int | None]:
+    """Parse (width, height) from a PNG byte string's IHDR chunk.
+
+    Returns ``(None, None)`` if *data* is not a well-formed PNG (wrong
+    signature, wrong IHDR chunk tag, or too short to contain one) rather
+    than raising — callers treat missing dimensions as an acceptable
+    degraded result, not an error.
+    """
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return (None, None)
+    if len(data) < 24:
+        return (None, None)
+    if data[12:16] != b"IHDR":
+        return (None, None)
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return (width, height)
+
+
+def screenshot(full_page: bool = False) -> Any:
     """Capture a PNG screenshot of the current Chrome viewport.
 
     Parameters
@@ -348,14 +374,42 @@ def screenshot(full_page: bool = False) -> Image:
 
     Returns
     -------
-    Image
-        A FastMCP ``Image`` object containing the PNG bytes.
+    list
+        ``[Image, metadata]`` — a FastMCP ``Image`` object containing the
+        PNG bytes, and a metadata dict with ``width``/``height`` (parsed
+        from the PNG's own IHDR chunk, not a ``Page.getLayoutMetrics``
+        round-trip) plus ``url``/``title`` (from ``Target.getTargetInfo``,
+        read the same way ``get_page_info()`` does). This is an
+        intentional breaking change from the previous bare-``Image``
+        return. If the ``Target.getTargetInfo`` call fails (e.g. the tab
+        closed or navigated away between the screenshot capture and this
+        second CDP call), the already-captured image is not lost — ``url``
+        and ``title`` fall back to ``None`` in the returned metadata instead
+        of raising.
     """
     # TODO(#3): wire captureBeyondViewport when full_page is True
     engine = _get_engine()
     result = engine.session.send("Page.captureScreenshot", {"format": "png"})
     png_bytes = base64.b64decode(result["data"])
-    return Image(data=png_bytes, format="png")
+    width, height = _png_dimensions(png_bytes)
+    try:
+        target_result = engine.session.send("Target.getTargetInfo", {})
+        target_info = target_result["targetInfo"]
+        url = target_info["url"]
+        title = target_info["title"]
+    except Exception as exc:  # noqa: BLE001 - must not lose a captured screenshot
+        logger.debug("screenshot() Target.getTargetInfo failed: %s", exc)
+        url = None
+        title = None
+    metadata = {
+        "width": width,
+        "height": height,
+        "url": url,
+        "title": title,
+    }
+    # Intentional two-item [Image, metadata] contract (see plan #42), not a bug:
+    # wire serialization is verified by tests/test_fastmcp_client.py::test_screenshot_returns_image_content_block.
+    return [Image(data=png_bytes, format="png"), metadata]
 
 
 def evaluate_js(expression: str) -> dict:
@@ -530,10 +584,19 @@ def wait_for_network_idle(timeout: float = 30.0) -> dict:
     timeout:
         Maximum seconds to wait (default 30).
 
+    A settle window (module constant ``_NETWORK_IDLE_SETTLE``, default 0.3s)
+    is slept after listener registration but before the idleness check, to
+    catch requests that arrive just after this tool starts watching.
+
     Returns
     -------
     dict
-        ``{"event": "networkIdle"}`` on success.
+        ``{"event": "networkIdle", "elapsed": float, "requests_seen": int,
+        "in_flight_after_settle": int}`` on success. ``elapsed`` is the
+        measured wall-clock duration of this call; ``requests_seen`` is the
+        total number of requests observed (monotonically increasing, unlike
+        the in-flight counter); ``in_flight_after_settle`` is the number of
+        requests still in flight right after the settle window.
 
     Raises
     ------
@@ -543,13 +606,16 @@ def wait_for_network_idle(timeout: float = 30.0) -> dict:
     engine = _get_engine()
     session = engine.session
 
+    start = time.monotonic()
     idle_event = threading.Event()
     _lock = threading.Lock()
     _in_flight: list[int] = [0]  # mutable cell so closures can mutate it
+    _seen: list[int] = [0]  # monotonically increasing total request count
 
     def _on_request(params: dict) -> None:  # noqa: ARG001
         with _lock:
             _in_flight[0] += 1
+            _seen[0] += 1
             idle_event.clear()
 
     def _on_done(params: dict) -> None:  # noqa: ARG001
@@ -561,20 +627,33 @@ def wait_for_network_idle(timeout: float = 30.0) -> dict:
     session.add_listener("Network.requestWillBeSent", _on_request)
     session.add_listener("Network.loadingFinished", _on_done)
     session.add_listener("Network.loadingFailed", _on_done)
-    # Pre-set only when no requests are already in flight, so that a request
-    # that arrived via the WS daemon thread during/after listener registration
-    # (which increments _in_flight) is not erroneously reported as idle.
-    with _lock:
-        if _in_flight[0] == 0:
-            idle_event.set()
     try:
-        fired = idle_event.wait(timeout=timeout)
+        # Grace period for late-arriving requests — must be time.sleep, not
+        # idle_event.wait(): existing tests monkeypatch threading.Event.wait
+        # to return False globally, which would swallow an Event.wait-based
+        # settle instead of actually delaying.
+        time.sleep(min(_NETWORK_IDLE_SETTLE, max(0.0, timeout)))
+        # Re-evaluate idleness post-settle under the lock, using the live
+        # in-flight counter rather than a hardcoded 0.
+        with _lock:
+            in_flight_after_settle = _in_flight[0]
+            if in_flight_after_settle == 0:
+                idle_event.set()
+            else:
+                idle_event.clear()
+        remaining = max(0.0, timeout - (time.monotonic() - start))
+        fired = idle_event.wait(remaining)
         if not fired:
             raise TimeoutError(
                 f"Network did not go idle within {timeout}s "
                 f"({_in_flight[0]} request(s) still in flight)"
             )
-        return {"event": "networkIdle"}
+        return {
+            "event": "networkIdle",
+            "elapsed": round(time.monotonic() - start, 3),
+            "requests_seen": _seen[0],
+            "in_flight_after_settle": in_flight_after_settle,
+        }
     finally:
         session.remove_listener("Network.requestWillBeSent", _on_request)
         session.remove_listener("Network.loadingFinished", _on_done)
@@ -832,6 +911,81 @@ def _resolve_element_center(session: CDPSession, selector: str) -> tuple[float, 
     return float(value["x"]), float(value["y"])
 
 
+def get_element_info(selector: str) -> dict:
+    """Inspect the first element matching *selector* without side effects.
+
+    Single ``Runtime.evaluate`` round-trip. Unlike ``_resolve_element_center``,
+    this deliberately does **not** call ``scrollIntoView()`` — inspection must
+    not have a side effect that changes the ``rect`` it reports.
+
+    Parameters
+    ----------
+    selector:
+        A CSS selector string.
+
+    Returns
+    -------
+    dict
+        Exactly six keys:
+
+        - ``exists`` — whether an element matched *selector*.
+        - ``visible`` — same predicate as ``wait_for_selector``'s
+          ``state="visible"``: not ``display:none``, not
+          ``visibility:hidden``, and a non-zero bounding rect.
+        - ``text`` — ``el.innerText``, truncated to 2000 characters in JS
+          so an oversized string never crosses the wire.
+        - ``value`` — ``el.value`` if it is a string, else ``None``.
+        - ``checked`` — ``el.checked`` if it is a boolean, else ``None``.
+        - ``rect`` — an explicitly built plain object
+          ``{x, y, width, height, top, right, bottom, left}`` from
+          ``el.getBoundingClientRect()``.
+
+        A selector matching nothing is a normal answer, not an error:
+        ``{"exists": False, "visible": False, "text": None, "value": None,
+        "checked": None, "rect": None}``.
+
+    Raises
+    ------
+    RuntimeError
+        If the Runtime.evaluate call returns exceptionDetails.
+    """
+    expr = (
+        f"(function(){{"
+        f"  var el = document.querySelector({selector!r});"
+        f"  if (!el) {{"
+        f"    return {{exists: false, visible: false, text: null, "
+        f"value: null, checked: null, rect: null}};"
+        f"  }}"
+        f"  var s = window.getComputedStyle(el);"
+        f"  var r = el.getBoundingClientRect();"
+        f"  var visible = !(s.display === 'none' || s.visibility === 'hidden') "
+        f"&& r.width > 0 && r.height > 0;"
+        f"  return {{"
+        f"    exists: true,"
+        f"    visible: visible,"
+        f"    text: (el.innerText || '').slice(0, 2000),"
+        f"    value: typeof el.value === 'string' ? el.value : null,"
+        f"    checked: typeof el.checked === 'boolean' ? el.checked : null,"
+        f"    rect: {{"
+        f"      x: r.x, y: r.y, width: r.width, height: r.height,"
+        f"      top: r.top, right: r.right, bottom: r.bottom, left: r.left"
+        f"    }}"
+        f"  }};"
+        f"}})();"
+    )
+    engine = _get_engine()
+    result = engine.session.send(
+        "Runtime.evaluate",
+        {"expression": expr, "awaitPromise": False, "returnByValue": True},
+    )
+    if result.get("exceptionDetails"):
+        raise RuntimeError(
+            f"JS exception in get_element_info({selector!r}): "
+            f"{result['exceptionDetails']}"
+        )
+    return result.get("result", {}).get("value")
+
+
 def click(selector: str) -> dict:
     """Click the first element matching *selector* using trusted mouse events.
 
@@ -909,6 +1063,10 @@ def type(selector: str, text: str) -> dict:
     ``Input.dispatchKeyEvent`` keyDown + keyUp for each character so that
     ``event.isTrusted`` is ``true`` and ``keydown``/``keyup`` handlers fire.
 
+    ``fill()`` also now focuses the element it fills, so both tools leave
+    the element focused afterward — either one composes with a follow-up
+    ``press_key("Enter")`` targeting that element.
+
     Parameters
     ----------
     selector:
@@ -950,12 +1108,16 @@ def type(selector: str, text: str) -> dict:
 
 
 def fill(selector: str, value: str) -> dict:
-    """Set the value of *selector* and dispatch input/change events.
+    """Focus *selector*, set its value, and dispatch input/change events.
 
     Unlike ``type()``, this sets the element's ``.value`` property directly and
     fires synthetic ``input`` and ``change`` events — suitable for programmatic
     form-fill where character-by-character key replay is undesirable (e.g. large
     text, password fields, date pickers).
+
+    Focuses the element (``el.focus()``) before setting the value, so a
+    follow-up ``press_key("Enter")`` targets the filled element — matching
+    ``type()``, which also leaves the element focused after typing.
 
     Uses the native input value setter so that React-controlled inputs register
     the change correctly before the events are dispatched.
@@ -987,6 +1149,7 @@ def fill(selector: str, value: str) -> dict:
         f"(function(){{"
         f"  var el = document.querySelector({selector!r});"
         f"  if (!el) return false;"
+        f"  el.focus();"
         f"  var nativeInputValueSetter = Object.getOwnPropertyDescriptor("
         f"    Object.getPrototypeOf(el), 'value')?.set;"
         f"  if (nativeInputValueSetter) {{"
@@ -1110,6 +1273,7 @@ mcp.add_tool(Tool.from_function(cdp))
 mcp.add_tool(Tool.from_function(get_instance_info))
 mcp.add_tool(Tool.from_function(get_console_logs))
 mcp.add_tool(Tool.from_function(get_network_log))
+mcp.add_tool(Tool.from_function(get_element_info))
 mcp.add_tool(Tool.from_function(click))
 mcp.add_tool(Tool.from_function(hover))
 mcp.add_tool(Tool.from_function(type))

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import collections
 import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -224,65 +225,270 @@ class TestGetPageInfo:
 # ── screenshot ────────────────────────────────────────────────────────────────
 
 class TestScreenshot:
-    """Tests for the screenshot() tool."""
+    """Tests for the screenshot() tool.
+
+    #41.3: screenshot() becomes a breaking change from a bare Image return to
+    a [Image, metadata] pair, so every test that drives the CDP mock now
+    supplies a two-element `side_effect` list — one reply for
+    Page.captureScreenshot, one for the new Target.getTargetInfo call — in
+    place of a single `return_value`.
+    """
 
     def _make_png_b64(self) -> str:
-        """Return a base64-encoded string of a few arbitrary bytes (fake PNG)."""
+        """Return a base64-encoded string of a few arbitrary bytes (fake PNG,
+        no well-formed IHDR — fine for tests that don't assert on dimensions)."""
         return base64.b64encode(b"\x89PNG fake").decode()
 
+    def _make_well_formed_png_bytes(self, width: int, height: int) -> bytes:
+        """Build a byte string with a real PNG signature + IHDR chunk carrying
+        *width*/*height*, so _png_dimensions() can parse it."""
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + (13).to_bytes(4, "big")  # IHDR chunk length
+            + b"IHDR"
+            + width.to_bytes(4, "big")
+            + height.to_bytes(4, "big")
+            + b"\x08\x02\x00\x00\x00restofchunk"
+        )
+
+    def _target_info_reply(self, url="http://example.test", title="Example"):
+        return {"targetInfo": {"url": url, "title": title}}
+
     def test_returns_image_object(self):
-        """screenshot() must return a FastMCP Image instance."""
+        """screenshot() must return a FastMCP Image instance as element [0]."""
         engine = _fake_engine_with_session()
-        engine.session.send.return_value = {"data": self._make_png_b64()}
+        engine.session.send.side_effect = [
+            {"data": self._make_png_b64()},
+            self._target_info_reply(),
+        ]
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             result = screenshot()
 
-        assert isinstance(result, Image)
+        assert isinstance(result[0], Image)
 
     def test_image_has_png_format(self):
         """screenshot() Image must be created with format='png', which the
         public fastmcp.Image.to_image_content() surfaces as mimeType='image/png'."""
         engine = _fake_engine_with_session()
-        engine.session.send.return_value = {"data": self._make_png_b64()}
+        engine.session.send.side_effect = [
+            {"data": self._make_png_b64()},
+            self._target_info_reply(),
+        ]
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             result = screenshot()
 
-        assert result.to_image_content().mimeType == "image/png"
+        assert result[0].to_image_content().mimeType == "image/png"
 
     def test_image_data_is_decoded_bytes(self):
         """screenshot() must base64-decode the CDP data and embed it as bytes."""
         raw_bytes = b"\x89PNG\r\n\x1a\n fake content"
         engine = _fake_engine_with_session()
-        engine.session.send.return_value = {
-            "data": base64.b64encode(raw_bytes).decode()
-        }
+        engine.session.send.side_effect = [
+            {"data": base64.b64encode(raw_bytes).decode()},
+            self._target_info_reply(),
+        ]
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             result = screenshot()
 
-        assert result.data == raw_bytes
+        assert result[0].data == raw_bytes
 
     def test_calls_page_capture_screenshot(self):
-        """screenshot() must send Page.captureScreenshot with format='png'."""
+        """screenshot() must send Page.captureScreenshot with format='png' as
+        its first CDP call."""
         engine = _fake_engine_with_session()
-        engine.session.send.return_value = {"data": self._make_png_b64()}
+        engine.session.send.side_effect = [
+            {"data": self._make_png_b64()},
+            self._target_info_reply(),
+        ]
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             screenshot()
 
-        engine.session.send.assert_called_once_with(
-            "Page.captureScreenshot", {"format": "png"}
-        )
+        first_call = engine.session.send.call_args_list[0]
+        assert first_call[0] == ("Page.captureScreenshot", {"format": "png"})
 
     def test_full_page_flag_accepted_without_error(self):
         """screenshot(full_page=True) must not raise — it's silently ignored for MVP."""
         engine = _fake_engine_with_session()
-        engine.session.send.return_value = {"data": self._make_png_b64()}
+        engine.session.send.side_effect = [
+            {"data": self._make_png_b64()},
+            self._target_info_reply(),
+        ]
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             screenshot(full_page=True)  # must not raise
+
+    def test_returns_image_and_metadata_pair(self):
+        """Driving test (#41.3): screenshot() must return [Image, metadata]
+        where metadata carries width/height (from the PNG's own IHDR chunk,
+        not a Page.getLayoutMetrics round-trip) plus url/title from
+        Target.getTargetInfo."""
+        engine = _fake_engine_with_session()
+        png_bytes = self._make_well_formed_png_bytes(10, 20)
+        engine.session.send.side_effect = [
+            {"data": base64.b64encode(png_bytes).decode()},
+            self._target_info_reply(url="http://example.test", title="Example"),
+        ]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = screenshot()
+
+        # Unpacking a bare Image (today's return shape) raises TypeError —
+        # that is the expected RED for this driving test.
+        image, metadata = result
+
+        assert isinstance(image, Image)
+        assert metadata == {
+            "width": 10,
+            "height": 20,
+            "url": "http://example.test",
+            "title": "Example",
+        }
+
+    def test_does_not_call_get_layout_metrics(self):
+        """screenshot() must source width/height from the decoded PNG bytes,
+        never from a Page.getLayoutMetrics CDP round-trip (#41.3)."""
+        engine = _fake_engine_with_session()
+        engine.session.send.side_effect = [
+            {"data": base64.b64encode(self._make_well_formed_png_bytes(1, 1)).decode()},
+            self._target_info_reply(),
+        ]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            screenshot()
+
+        methods_called = [c[0][0] for c in engine.session.send.call_args_list]
+        assert "Page.getLayoutMetrics" not in methods_called
+
+    def test_metadata_url_and_title_from_target_info(self):
+        """screenshot()'s metadata url/title must come from Target.getTargetInfo,
+        read the same way get_page_info() reads it (#41.3)."""
+        engine = _fake_engine_with_session()
+        engine.session.send.side_effect = [
+            {"data": self._make_png_b64()},
+            self._target_info_reply(url="http://other.test", title="Other"),
+        ]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = screenshot()
+
+        _, metadata = result
+        assert metadata["url"] == "http://other.test"
+        assert metadata["title"] == "Other"
+
+    def test_second_png_size_and_second_call_method_name_via_screenshot(self):
+        """#41.2 test-critic gap: the only PNG-size case previously driven
+        through screenshot() itself was 10x20 — a hardcoded width/height
+        literal in screenshot() could still coincidentally satisfy that one
+        case. Drive a second, distinct size (640x480, matching the
+        TestPngDimensions unit-test fixture) through screenshot() itself so
+        two different literal values would have to both be hardcoded to
+        fake a pass. Also assert the second CDP call's method name is
+        literally "Target.getTargetInfo", not just that url/title appear in
+        the result."""
+        engine = _fake_engine_with_session()
+        png_bytes = self._make_well_formed_png_bytes(640, 480)
+        engine.session.send.side_effect = [
+            {"data": base64.b64encode(png_bytes).decode()},
+            self._target_info_reply(url="http://example.test", title="Example"),
+        ]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = screenshot()
+
+        _, metadata = result
+        assert metadata["width"] == 640
+        assert metadata["height"] == 480
+
+        second_call = engine.session.send.call_args_list[1]
+        assert second_call[0][0] == "Target.getTargetInfo"
+
+    def test_target_info_failure_does_not_lose_captured_screenshot(self):
+        """Review fix (#42): if Target.getTargetInfo fails after the
+        screenshot bytes were already captured and decoded (e.g. the tab
+        closed or navigated away between the two CDP calls), screenshot()
+        must not lose the already-successfully-captured image — it must
+        still return [Image, metadata] with url/title falling back to None,
+        rather than propagating the exception."""
+        engine = _fake_engine_with_session()
+        png_bytes = self._make_well_formed_png_bytes(10, 20)
+        engine.session.send.side_effect = [
+            {"data": base64.b64encode(png_bytes).decode()},
+            RuntimeError("target closed"),
+        ]
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = screenshot()  # must not raise
+
+        image, metadata = result
+        assert isinstance(image, Image)
+        assert metadata == {
+            "width": 10,
+            "height": 20,
+            "url": None,
+            "title": None,
+        }
+
+
+class TestPngDimensions:
+    """Tests for the private _png_dimensions() helper (#41.3)."""
+
+    def test_parses_width_and_height_from_ihdr(self):
+        """_png_dimensions() must read width/height as big-endian uint32 from
+        the IHDR chunk at bytes [16:20]/[20:24]."""
+        from chrome_wrapper_plugin.server import _png_dimensions
+
+        header = (
+            b"\x89PNG\r\n\x1a\n"
+            + (13).to_bytes(4, "big")
+            + b"IHDR"
+            + (640).to_bytes(4, "big")
+            + (480).to_bytes(4, "big")
+        )
+        assert _png_dimensions(header) == (640, 480)
+
+    def test_returns_none_none_for_non_png_bytes(self):
+        """_png_dimensions() must return (None, None) for bytes that don't
+        start with the PNG signature."""
+        from chrome_wrapper_plugin.server import _png_dimensions
+
+        assert _png_dimensions(b"not a png at all") == (None, None)
+
+    def test_returns_none_none_for_wrong_signature_at_full_length(self):
+        """A buffer that is long enough (>=24 bytes) to contain a full IHDR
+        chunk, but whose leading 8 bytes are not the PNG signature, must
+        still return (None, None) — this exercises the signature check
+        itself rather than the length-guard short-circuiting it."""
+        from chrome_wrapper_plugin.server import _png_dimensions
+
+        buf = b"NOTAPNG!" + (13).to_bytes(4, "big") + b"IHDR" + (1).to_bytes(4, "big") * 2
+        assert len(buf) >= 24
+        assert _png_dimensions(buf) == (None, None)
+
+    def test_returns_none_none_for_wrong_ihdr_tag_at_full_length(self):
+        """A buffer with a valid PNG signature and correct length, but whose
+        chunk-type bytes at [12:16] are not "IHDR", must return (None, None)
+        — this exercises the IHDR-tag check itself."""
+        from chrome_wrapper_plugin.server import _png_dimensions
+
+        buf = (
+            b"\x89PNG\r\n\x1a\n"
+            + (13).to_bytes(4, "big")
+            + b"XXXX"
+            + (1).to_bytes(4, "big") * 2
+        )
+        assert len(buf) >= 24
+        assert _png_dimensions(buf) == (None, None)
+
+    def test_returns_none_none_for_truncated_signature_only(self):
+        """_png_dimensions() must not raise on a signature-only buffer with no
+        IHDR chunk (len < 24) — it must return (None, None) instead."""
+        from chrome_wrapper_plugin.server import _png_dimensions
+
+        assert _png_dimensions(b"\x89PNG\r\n\x1a\n") == (None, None)
 
 
 # ── evaluate_js ───────────────────────────────────────────────────────────────
@@ -804,6 +1010,174 @@ class TestResolveElementCenter:
         assert "#my-btn" in call_args[0][1]["expression"]
 
 
+# ── get_element_info ─────────────────────────────────────────────────────────
+#
+# get_element_info() does not exist yet (#41.1) — every test below imports it
+# locally inside the test body (mirroring tests/test_fastmcp_client.py's
+# documented discipline) so a missing symbol surfaces as a named failing test
+# for *this* class only, rather than an ImportError that breaks collection of
+# every other test in this file.
+
+class TestGetElementInfo:
+    """Tests for the get_element_info(selector) tool (#41.1)."""
+
+    _MISSING_ELEMENT_VALUE = {
+        "exists": False,
+        "visible": False,
+        "text": None,
+        "value": None,
+        "checked": None,
+        "rect": None,
+    }
+
+    def test_returns_exactly_the_six_fields(self):
+        """Driving test: get_element_info() must return exactly the six
+        documented keys — exists, visible, text, value, checked, rect — AND
+        the CDP reply's actual values must flow through unchanged, so a
+        hardcoded/discarded-reply implementation cannot pass."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        cdp_value = {
+            "exists": True,
+            "visible": True,
+            "text": "hello",
+            "value": "abc",
+            "checked": None,
+            "rect": {
+                "x": 1, "y": 2, "width": 3, "height": 4,
+                "top": 2, "right": 4, "bottom": 6, "left": 1,
+            },
+        }
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": cdp_value}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_element_info("#name")
+
+        assert set(result.keys()) == {
+            "exists", "visible", "text", "value", "checked", "rect",
+        }
+        assert result == cdp_value
+
+    def test_missing_element_returns_all_none_or_false(self):
+        """A selector that matches nothing is a normal answer, not an error:
+        exists/visible are False and the rest are None."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = get_element_info("#missing")
+
+        assert result == self._MISSING_ELEMENT_VALUE
+
+    def test_expression_interpolates_selector(self):
+        """The selector must be interpolated into the JS expression, same
+        style as _resolve_element_center/wait_for_selector."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            get_element_info("#foo-bar")
+
+        expr = engine.session.send.call_args[0][1]["expression"]
+        assert "#foo-bar" in expr
+
+    def test_expression_reuses_visibility_predicate_and_truncates_text_in_js(self):
+        """The expression must reuse wait_for_selector's visible predicate
+        (not display:none, not visibility:hidden) and truncate innerText to
+        2000 chars in JS, so an oversized string never crosses the wire."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            get_element_info("#foo")
+
+        expr = engine.session.send.call_args[0][1]["expression"]
+        assert "display" in expr and "none" in expr
+        assert "visibility" in expr and "hidden" in expr
+        assert "innerText" in expr
+        assert "2000" in expr and "slice" in expr
+
+    def test_expression_builds_rect_fields_explicitly(self):
+        """rect must be built as an explicit plain object from
+        getBoundingClientRect() — returnByValue serialises a raw DOMRect to
+        {} because its properties are prototype getters, not own props."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            get_element_info("#foo")
+
+        expr = engine.session.send.call_args[0][1]["expression"]
+        assert "getBoundingClientRect" in expr
+        for field in ("x", "y", "width", "height", "top", "right", "bottom", "left"):
+            assert field in expr, f"rect field {field!r} not built explicitly in {expr!r}"
+
+    def test_expression_does_not_call_scroll_into_view(self):
+        """Unlike _resolve_element_center, get_element_info() must not scroll
+        the element into view — inspection must not have a side effect that
+        changes the rect it reports."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            get_element_info("#foo")
+
+        expr = engine.session.send.call_args[0][1]["expression"]
+        assert "scrollIntoView" not in expr
+
+    def test_raises_runtime_error_on_exception_details(self):
+        """get_element_info() must raise RuntimeError when CDP Runtime.evaluate
+        returns exceptionDetails, matching fill()/select_option()."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "exceptionDetails": {"text": "syntax error"},
+            "result": {},
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            with pytest.raises(RuntimeError):
+                get_element_info("#foo")
+
+    def test_sends_exactly_one_runtime_evaluate_call(self):
+        """get_element_info() must resolve everything in a single CDP
+        round-trip — one Runtime.evaluate call, nothing more."""
+        from chrome_wrapper_plugin.server import get_element_info
+
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {
+            "result": {"value": dict(self._MISSING_ELEMENT_VALUE)}
+        }
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            get_element_info("#foo")
+
+        assert engine.session.send.call_count == 1
+        assert engine.session.send.call_args[0][0] == "Runtime.evaluate"
+
+
 # ── click ─────────────────────────────────────────────────────────────────────
 
 class TestClick:
@@ -967,6 +1341,17 @@ class TestType:
             with pytest.raises(ValueError, match="No element found"):
                 type_text("#missing", "hello")
 
+    def test_docstring_cross_references_fill_focus_behavior(self):
+        """#40: type()'s docstring must cross-reference that fill() also now
+        leaves the element focused, so a caller knows both tools compose with
+        a follow-up press_key("Enter"). Requires both "fill" and "focus" to
+        appear, so a docstring that already said "fill" for unrelated
+        reasons (e.g. "form-fill") can't pass vacuously without actually
+        documenting the focus behaviour."""
+        doc = type_text.__doc__.lower()
+        assert "fill" in doc, type_text.__doc__
+        assert "focus" in doc, type_text.__doc__
+
 
 # ── fill ──────────────────────────────────────────────────────────────────────
 
@@ -1021,6 +1406,42 @@ class TestFill:
              mock.patch.object(server_module, "_resolve_element_center", side_effect=ValueError("No element found")):
             with pytest.raises(ValueError, match="No element found"):
                 fill("#missing", "value")
+
+    def test_fill_expression_focuses_before_setting_value(self):
+        """Driving test (#40): fill() must call el.focus() before setting the
+        value, so a follow-up press_key("Enter") targets the filled element —
+        this is the fill()/type() focus asymmetry the ticket reports."""
+        engine = _fake_engine_with_session()
+        engine.session.send.return_value = {"result": {"value": True}}
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_resolve_element_center"):
+            fill("#name", "Alice")
+
+        expr = engine.session.send.call_args[0][1]["expression"]
+        assert "el.focus()" in expr, expr
+
+        focus_index = expr.index("el.focus()")
+        value_set_indices = [
+            i for i in (
+                expr.find("nativeInputValueSetter.call(el,"),
+                expr.find("el.value ="),
+            )
+            if i != -1
+        ]
+        assert value_set_indices, expr
+        assert all(focus_index < i for i in value_set_indices), expr
+
+    def test_fill_docstring_mentions_focus(self):
+        """#40: fill()'s docstring must state that it focuses the element, so
+        a caller knows a follow-up press_key("Enter") will target it. Checks
+        for a phrase naming the concrete behaviour ("focuses the element")
+        rather than a bare "focus" substring match, so an unrelated sentence
+        that happens to contain the word "focus" can't satisfy this
+        vacuously."""
+        doc = fill.__doc__.lower()
+        assert "focus" in doc, fill.__doc__
+        assert "focuses the element" in doc, fill.__doc__
 
 
 # ── press_key ─────────────────────────────────────────────────────────────────
@@ -1269,13 +1690,137 @@ class TestWaitForNetworkIdle:
     """Tests for the wait_for_network_idle() tool."""
 
     def test_resolves_immediately_when_already_idle(self):
-        """wait_for_network_idle() returns {"event": "networkIdle"} when no requests are in flight."""
+        """wait_for_network_idle() returns the full networkIdle payload —
+        event, requests_seen, in_flight_after_settle, elapsed — when no
+        requests are in flight (#41.2). `elapsed` must be bounded below by
+        the real settle window (which is not mocked here, so a genuine
+        time.sleep must occur) and bounded above generously, so a
+        hardcoded literal like 0.0 cannot pass."""
+        engine = _fake_engine_with_session()
+        wall_start = time.monotonic()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            result = wait_for_network_idle()
+
+        wall_elapsed = time.monotonic() - wall_start
+
+        assert result["event"] == "networkIdle"
+        assert result["requests_seen"] == 0
+        assert result["in_flight_after_settle"] == 0
+        assert isinstance(result["elapsed"], float)
+        assert result["elapsed"] >= server_module._NETWORK_IDLE_SETTLE * 0.8, result
+        assert result["elapsed"] <= wall_elapsed + 0.05, (result, wall_elapsed)
+
+    def test_sends_time_sleep_for_settle_window(self):
+        """Driving test (#41.2): wait_for_network_idle() must sleep for a
+        settle window (to catch late-arriving requests) before evaluating
+        whether the network is idle. Today it never calls time.sleep at all."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch("chrome_wrapper_plugin.server.time.sleep") as mock_sleep:
+            wait_for_network_idle()
+
+        mock_sleep.assert_called_once()
+
+    def test_returns_four_key_networkidle_payload(self):
+        """Driving test (#41.2): the return dict must carry exactly
+        event/elapsed/requests_seen/in_flight_after_settle — today it is only
+        {"event": "networkIdle"}, so requests_seen is missing."""
         engine = _fake_engine_with_session()
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             result = wait_for_network_idle()
 
-        assert result == {"event": "networkIdle"}
+        assert set(result.keys()) == {
+            "event", "elapsed", "requests_seen", "in_flight_after_settle",
+        }
+
+    def test_default_settle_constant_is_point_three_seconds(self):
+        """#41.2: the settle window defaults to 0.3s, exposed as a
+        module-level constant so tests can monkeypatch it small."""
+        assert server_module._NETWORK_IDLE_SETTLE == 0.3
+
+    def test_settle_sleep_is_clamped_to_timeout(self):
+        """#41.2: when timeout is shorter than the settle window, the settle
+        sleep must be clamped to timeout, never overrun the caller's budget."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch("chrome_wrapper_plugin.server.time.sleep") as mock_sleep:
+            wait_for_network_idle(timeout=0.05)
+
+        mock_sleep.assert_called_once_with(
+            min(server_module._NETWORK_IDLE_SETTLE, 0.05)
+        )
+
+    def test_settle_window_actually_elapses_wall_clock_time(self):
+        """#41.2: the settle window must be a real time.sleep, not
+        threading.Event.wait — the existing timeout tests below monkeypatch
+        threading.Event.wait globally to return False, which would swallow an
+        Event.wait-based settle instead of actually delaying. Event.wait is
+        mocked to return True here (fires immediately) so the *only* possible
+        source of wall-clock delay is the settle sleep itself."""
+        engine = _fake_engine_with_session()
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_NETWORK_IDLE_SETTLE", 0.05), \
+             mock.patch.object(threading.Event, "wait", return_value=True):
+            start = time.monotonic()
+            wait_for_network_idle()
+            elapsed = time.monotonic() - start
+
+        # On windows-latest CI, time.sleep(0.05) has been observed to return
+        # ~3ms early due to timer/scheduler granularity; a 10% tolerance
+        # (>= 0.045) absorbs that while still catching an implementation
+        # that delivers meaningfully less than the intended settle duration,
+        # and clearly distinguishes a real ~50ms sleep from an Event.wait-
+        # based settle, which would fire near-instantly (~0ms).
+        assert elapsed >= 0.05 * 0.9, elapsed
+
+    def test_requests_seen_counts_total_requests_not_just_in_flight(self):
+        """#41.2: requests_seen must be a monotonically increasing total
+        count, unlike the in-flight counter which decrements back to 0."""
+        import threading as _threading
+
+        engine = _fake_engine_with_session()
+        captured: dict = {}
+        listeners_ready = _threading.Event()
+
+        def _capture_listener(event_name, cb):
+            captured[event_name] = cb
+            if len(captured) == 3:
+                # Two requests arrive; only the first is settled here — the
+                # second is completed from the main thread below, mirroring
+                # test_resolves_after_request_completes's synchronisation.
+                captured["Network.requestWillBeSent"]({})
+                captured["Network.requestWillBeSent"]({})
+                captured["Network.loadingFinished"]({})
+                listeners_ready.set()
+
+        engine.session.add_listener.side_effect = _capture_listener
+
+        result_holder: dict = {}
+        error_holder: dict = {}
+
+        def _run():
+            try:
+                result_holder["r"] = wait_for_network_idle()
+            except Exception as e:  # noqa: BLE001 - surfaced via error_holder
+                error_holder["e"] = e
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine):
+            t = _threading.Thread(target=_run)
+            t.start()
+
+            assert listeners_ready.wait(timeout=5.0), "Listeners never registered"
+            captured["Network.loadingFinished"]({})  # second request completes
+
+            t.join(timeout=5.0)
+
+        assert not t.is_alive(), "Tool thread did not finish — possible deadlock"
+        assert not error_holder, f"Unexpected error: {error_holder}"
+        assert result_holder["r"]["requests_seen"] == 2
 
     def test_resolves_after_request_completes(self):
         """wait_for_network_idle() resolves once an in-flight request finishes.
@@ -1330,7 +1875,62 @@ class TestWaitForNetworkIdle:
 
         assert not t.is_alive(), "Tool thread did not finish — possible deadlock"
         assert not error_holder, f"Unexpected error: {error_holder}"
-        assert result_holder.get("r") == {"event": "networkIdle"}
+        result = result_holder.get("r")
+        assert result["event"] == "networkIdle"
+        assert result["requests_seen"] == 1
+        assert result["in_flight_after_settle"] == 0
+
+    def test_in_flight_after_settle_is_nonzero_when_request_still_pending(self):
+        """#41.2: in_flight_after_settle must report the live counter, not a
+        hardcoded 0. Fires a request that is still in flight when the
+        (shortened) settle window elapses, then completes it afterward so
+        the call still resolves normally — the request only finishes
+        *after* the settle re-evaluation has already captured in_flight==1.
+        """
+        import threading as _threading
+
+        engine = _fake_engine_with_session()
+        captured: dict = {}
+        listeners_ready = _threading.Event()
+
+        def _capture_listener(event_name, cb):
+            captured[event_name] = cb
+            if len(captured) == 3:
+                # Request arrives before the settle sleep starts, and is
+                # deliberately left in-flight — not completed here.
+                captured["Network.requestWillBeSent"]({})
+                listeners_ready.set()
+
+        engine.session.add_listener.side_effect = _capture_listener
+
+        result_holder: dict = {}
+        error_holder: dict = {}
+
+        def _run():
+            try:
+                result_holder["r"] = wait_for_network_idle()
+            except Exception as e:  # noqa: BLE001 - surfaced via error_holder
+                error_holder["e"] = e
+
+        with mock.patch.object(server_module, "_get_engine", return_value=engine), \
+             mock.patch.object(server_module, "_NETWORK_IDLE_SETTLE", 0.05):
+            t = _threading.Thread(target=_run)
+            t.start()
+
+            assert listeners_ready.wait(timeout=5.0), "Listeners never registered"
+            # Wait past the (shortened) settle window while the request is
+            # still pending, so the post-settle re-evaluation captures
+            # in_flight_after_settle == 1, then complete it.
+            time.sleep(0.2)
+            captured["Network.loadingFinished"]({})
+
+            t.join(timeout=5.0)
+
+        assert not t.is_alive(), "Tool thread did not finish — possible deadlock"
+        assert not error_holder, f"Unexpected error: {error_holder}"
+        result = result_holder.get("r")
+        assert result["event"] == "networkIdle"
+        assert result["in_flight_after_settle"] == 1, result
 
     def test_raises_timeout_error_when_requests_never_complete(self):
         """wait_for_network_idle() raises TimeoutError when network never goes idle."""
