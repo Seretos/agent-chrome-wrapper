@@ -15,7 +15,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP, Image
+from fastmcp import FastMCP
+from fastmcp.tools import Tool
+from fastmcp.utilities.types import Image
 
 from chrome_wrapper_plugin.cdp import CDPSession
 from chrome_wrapper_plugin.chrome_process import (
@@ -266,7 +268,6 @@ def _get_engine() -> ChromeEngine:
     return _engine
 
 
-@mcp.tool()
 def navigate(url: str, wait_until: str = "load") -> dict:
     """Navigate the current Chrome page to *url* and wait for it to load.
 
@@ -310,7 +311,6 @@ def navigate(url: str, wait_until: str = "load") -> dict:
         session.remove_listener("Page.loadEventFired", _on_load)
 
 
-@mcp.tool()
 def get_page_info() -> dict:
     """Return URL and title of the page currently loaded in Chrome.
 
@@ -329,7 +329,6 @@ def get_page_info() -> dict:
     }
 
 
-@mcp.tool()
 def screenshot(full_page: bool = False) -> Image:
     """Capture a PNG screenshot of the current Chrome viewport.
 
@@ -351,7 +350,6 @@ def screenshot(full_page: bool = False) -> Image:
     return Image(data=png_bytes, format="png")
 
 
-@mcp.tool()
 def evaluate_js(expression: str) -> dict:
     """Evaluate *expression* in the page's JavaScript context and return the result.
 
@@ -374,7 +372,6 @@ def evaluate_js(expression: str) -> dict:
     )
 
 
-@mcp.tool()
 def wait_for_selector(
     selector: str,
     timeout: float = 30.0,
@@ -463,7 +460,6 @@ def wait_for_selector(
         time.sleep(min(interval, remaining))
 
 
-@mcp.tool()
 def wait_for_navigation(timeout: float = 30.0) -> dict:
     """Wait for the next page load event to fire (Page.loadEventFired).
 
@@ -513,7 +509,6 @@ def wait_for_navigation(timeout: float = 30.0) -> dict:
         session.remove_listener("Page.loadEventFired", _on_load)
 
 
-@mcp.tool()
 def wait_for_network_idle(timeout: float = 30.0) -> dict:
     """Wait until all in-flight network requests have completed.
 
@@ -578,7 +573,6 @@ def wait_for_network_idle(timeout: float = 30.0) -> dict:
         session.remove_listener("Network.loadingFailed", _on_done)
 
 
-@mcp.tool()
 def sleep(seconds: float) -> dict:
     """Pause execution for *seconds* seconds.
 
@@ -605,7 +599,6 @@ def sleep(seconds: float) -> dict:
     return {"slept": seconds}
 
 
-@mcp.tool()
 def cdp(method: str, params: dict) -> dict:
     """Send a raw CDP command and return its result dict.
 
@@ -628,7 +621,6 @@ def cdp(method: str, params: dict) -> dict:
     return engine.session.send(method, params)
 
 
-@mcp.tool()
 def get_instance_info() -> dict:
     """Return information about the current Chrome instance for this session.
 
@@ -675,7 +667,6 @@ def get_instance_info() -> dict:
     }
 
 
-@mcp.tool()
 def get_console_logs() -> list:
     """Return and drain all buffered browser console entries since the last call.
 
@@ -713,7 +704,6 @@ def get_console_logs() -> list:
     return list(old)
 
 
-@mcp.tool()
 def get_network_log() -> list:
     """Return and drain all buffered network events since the last call.
 
@@ -784,7 +774,6 @@ def _resolve_element_center(session: CDPSession, selector: str) -> tuple[float, 
     return float(value["x"]), float(value["y"])
 
 
-@mcp.tool()
 def click(selector: str) -> dict:
     """Click the first element matching *selector* using trusted mouse events.
 
@@ -824,7 +813,6 @@ def click(selector: str) -> dict:
     return {"x": x, "y": y}
 
 
-@mcp.tool()
 def hover(selector: str) -> dict:
     """Move the mouse to the center of the first element matching *selector*.
 
@@ -856,7 +844,6 @@ def hover(selector: str) -> dict:
     return {"x": x, "y": y}
 
 
-@mcp.tool()
 def type(selector: str, text: str) -> dict:
     """Focus *selector* and type *text* using trusted keyboard events.
 
@@ -904,7 +891,6 @@ def type(selector: str, text: str) -> dict:
     return {"typed": len(text)}
 
 
-@mcp.tool()
 def fill(selector: str, value: str) -> dict:
     """Set the value of *selector* and dispatch input/change events.
 
@@ -967,7 +953,6 @@ def fill(selector: str, value: str) -> dict:
     return {"filled": True}
 
 
-@mcp.tool()
 def press_key(key: str) -> dict:
     """Press a keyboard key on the currently focused element.
 
@@ -992,7 +977,6 @@ def press_key(key: str) -> dict:
     return {"key": key}
 
 
-@mcp.tool()
 def select_option(selector: str, value: str) -> dict:
     """Select an option in a ``<select>`` element by value.
 
@@ -1050,6 +1034,30 @@ def select_option(selector: str, value: str) -> dict:
             f"Value {value!r} not in options for {selector!r}: {rv.get('options')}"
         )
     return {"selected": value}
+
+
+# Explicit tool registration — fastmcp 2.x's FastMCP.add_tool() requires a
+# `Tool` object (built via Tool.from_function()), not a bare callable, so the
+# `@mcp.tool()` decorators used under the vendored mcp<2 FastMCP were dropped
+# from the functions above in favour of this single block.
+mcp.add_tool(Tool.from_function(navigate))
+mcp.add_tool(Tool.from_function(get_page_info))
+mcp.add_tool(Tool.from_function(screenshot))
+mcp.add_tool(Tool.from_function(evaluate_js))
+mcp.add_tool(Tool.from_function(wait_for_selector))
+mcp.add_tool(Tool.from_function(wait_for_navigation))
+mcp.add_tool(Tool.from_function(wait_for_network_idle))
+mcp.add_tool(Tool.from_function(sleep))
+mcp.add_tool(Tool.from_function(cdp))
+mcp.add_tool(Tool.from_function(get_instance_info))
+mcp.add_tool(Tool.from_function(get_console_logs))
+mcp.add_tool(Tool.from_function(get_network_log))
+mcp.add_tool(Tool.from_function(click))
+mcp.add_tool(Tool.from_function(hover))
+mcp.add_tool(Tool.from_function(type))
+mcp.add_tool(Tool.from_function(fill))
+mcp.add_tool(Tool.from_function(press_key))
+mcp.add_tool(Tool.from_function(select_option))
 
 
 def main() -> None:

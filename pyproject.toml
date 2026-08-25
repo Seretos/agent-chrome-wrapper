@@ -9,7 +9,8 @@ description = "Provides an MCP that gives agents access to Chrome, starting a se
 requires-python = ">=3.11"
 authors = [{ name = "Arne von Appen" }]
 dependencies = [
-  "mcp>=1.2,<2",
+  "mcp>=1.2,<3",
+  "fastmcp>=2,<3",
   "websocket-client>=1.7",
   "pywin32>=306; sys_platform=='win32'",
 ]

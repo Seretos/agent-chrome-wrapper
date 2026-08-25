@@ -37,7 +37,7 @@ from chrome_wrapper_plugin.server import (
 )
 from chrome_wrapper_plugin.server import type as type_text
 from chrome_wrapper_plugin.server import sleep as sleep_tool
-from mcp.server.fastmcp import Image
+from fastmcp.utilities.types import Image
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -241,16 +241,15 @@ class TestScreenshot:
         assert isinstance(result, Image)
 
     def test_image_has_png_format(self):
-        """screenshot() Image must be created with format='png' (stored as _format)."""
+        """screenshot() Image must be created with format='png', which the
+        public fastmcp.Image.to_image_content() surfaces as mimeType='image/png'."""
         engine = _fake_engine_with_session()
         engine.session.send.return_value = {"data": self._make_png_b64()}
 
         with mock.patch.object(server_module, "_get_engine", return_value=engine):
             result = screenshot()
 
-        # FastMCP Image stores format in _format; _mime_type is derived from it.
-        assert result._format == "png"
-        assert result._mime_type == "image/png"
+        assert result.to_image_content().mimeType == "image/png"
 
     def test_image_data_is_decoded_bytes(self):
         """screenshot() must base64-decode the CDP data and embed it as bytes."""
