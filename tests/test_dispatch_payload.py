@@ -39,6 +39,7 @@ JOB_NAME = {
 
 DISPATCH_STEP_NAME = "Dispatch to agent-marketplace"
 FETCH_STEP_NAME = "Fetch changelog for dispatch"
+RELEASE_CREATE_STEP_NAME = "Create tag and GitHub Release"
 
 # Same TAG-source expression the dispatch step's own TAG env is bound to in
 # each workflow -- the fetch step's TAG must match it so `ref` and the
@@ -107,6 +108,19 @@ def _dispatch_step(path):
 
 def _fetch_step(path):
     return _find_step(path, JOB_NAME[path], FETCH_STEP_NAME)
+
+
+def _step_index(path, job_name, step_name):
+    workflow = _load_workflow(path)
+    jobs = workflow["jobs"]
+    assert job_name in jobs, f"job {job_name!r} not found in {path}"
+    steps = jobs[job_name]["steps"]
+    for index, step in enumerate(steps):
+        if step.get("name") == step_name:
+            return index
+    raise AssertionError(
+        f"step {step_name!r} not found in job {job_name!r} of {path}"
+    )
 
 
 def _extract_heredoc_block(run_text, open_marker="<<'PY'", end_token="PY"):
@@ -354,6 +368,63 @@ def test_changelog_is_fetched_for_the_dispatched_tag(workflow):
     )
 
 
+@pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
+def test_fetch_step_redirects_gh_stdout_to_changelog_file(workflow):
+    fetch_step = _fetch_step(workflow)
+    run_text = fetch_step.get("run", "")
+    fetch_env = fetch_step.get("env", {})
+    changelog_var = fetch_env.get("CHANGELOG_FILE")
+    assert changelog_var is not None, (
+        f"expected CHANGELOG_FILE in the {FETCH_STEP_NAME!r} step's env: "
+        f"mapping of {workflow}"
+    )
+    assert '> "$CHANGELOG_FILE"' in run_text, (
+        f"expected `gh release view` output to be redirected directly to "
+        f'"$CHANGELOG_FILE" in the {FETCH_STEP_NAME!r} step of {workflow}, '
+        f"got run text: {run_text!r}"
+    )
+    # The invocation and its redirect must co-occur on the SAME line: any
+    # command-substitution wrapper (single- or multi-line, e.g.
+    # `BODY=$(gh release view ...)` or a multi-line `BODY=$(\n  gh release
+    # view ...\n)`) necessarily separates the invocation from a direct
+    # `> "$CHANGELOG_FILE"` redirect onto different lines (or removes the
+    # direct redirect from the invocation's line entirely), so requiring
+    # same-line co-occurrence is what actually pins down "no round-trip
+    # through a variable" -- checking `gh release view` lines and the
+    # `> "$CHANGELOG_FILE"` redirect's presence in the step independently
+    # (as before) is satisfied by a multi-line command substitution whose
+    # redirect lives elsewhere in the step.
+    direct_redirect_lines = [
+        line
+        for line in run_text.splitlines()
+        if "gh release view" in line and '> "$CHANGELOG_FILE"' in line
+    ]
+    assert direct_redirect_lines, (
+        f"expected a `gh release view` invocation and its "
+        f'`> "$CHANGELOG_FILE"` redirect on the SAME line in the '
+        f"{FETCH_STEP_NAME!r} step of {workflow} -- a command substitution "
+        "(single- or multi-line) that round-trips gh's stdout through a "
+        "variable before redirecting it elsewhere would put the invocation "
+        f"and the redirect on different lines, got run text: {run_text!r}"
+    )
+    for line in direct_redirect_lines:
+        assert "$(" not in line, (
+            "the gh release view invocation must write gh's stdout straight "
+            "to $CHANGELOG_FILE via redirection, not round-trip it through a "
+            f"command substitution in {workflow}, got line: {line!r}"
+        )
+        assert "`" not in line, (
+            "the gh release view invocation must write gh's stdout straight "
+            "to $CHANGELOG_FILE via redirection, not round-trip it through a "
+            f"backtick command substitution in {workflow}, got line: {line!r}"
+        )
+    dispatch_env = _dispatch_step(workflow).get("env", {})
+    assert dispatch_env.get("CHANGELOG_FILE") == changelog_var, (
+        "expected the fetch step's redirection target to be the same "
+        "CHANGELOG_FILE env var the dispatch step consumes"
+    )
+
+
 # ---------------------------------------------------------------------------
 # R2 -- the payload is JSON-escaped and injection-proof
 # ---------------------------------------------------------------------------
@@ -523,11 +594,37 @@ def test_oversized_changelog_is_truncated_with_link(workflow, monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
+def test_truncation_budget_counts_utf8_bytes_not_characters(workflow, monkeypatch, tmp_path):
+    # 20000 chars but 60000 bytes (euro sign is 3 bytes in UTF-8). A
+    # character-based budget (len(body) > TRUNCATE_LIMIT) would never fire
+    # since 20000 <= 30000; a byte-based budget must fire since 60000 > 30000.
+    oversized = "€" * 20000
+    payload_file, _ = _run_builder(
+        workflow, monkeypatch, tmp_path,
+        changelog_present=True, changelog_body=oversized,
+    )
+    body = json.loads(payload_file.read_text(encoding="utf-8"))
+    changelog = body["client_payload"]["changelog"]
+    changelog_bytes = len(changelog.encode("utf-8"))
+    assert changelog_bytes < len(oversized.encode("utf-8")), (
+        "expected the oversized (60000-byte, 20000-char) changelog to be "
+        "truncated -- if the budget were character-based, 20000 chars would "
+        "be under the 30000 limit and no truncation would happen"
+    )
+    assert changelog_bytes <= TRUNCATE_LIMIT + 300, (
+        f"truncated changelog is {changelog_bytes} bytes, expected roughly "
+        f"{TRUNCATE_LIMIT} bytes plus a short truncation marker"
+    )
+
+
+@pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
 def test_truncation_never_emits_invalid_utf8(workflow, monkeypatch, tmp_path):
-    # 3-bytes-per-character fixture, sized so a naive byte-offset cut at
-    # TRUNCATE_LIMIT lands mid-codepoint unless truncation decodes with
-    # errors="ignore".
-    oversized = "€" * 20000  # euro sign: 3 bytes each in UTF-8 => 60000 bytes
+    # 3-bytes-per-character fixture, with a leading single ASCII byte so the
+    # byte-offset cut at TRUNCATE_LIMIT (30000) lands mid-codepoint: 1 ASCII
+    # byte + 29999 bytes of euro signs = 9999 whole euros (29997 bytes) plus
+    # 2 dangling bytes of the 10000th euro sign -- unless truncation decodes
+    # with errors="ignore".
+    oversized = "x" + "€" * 20000  # euro sign: 3 bytes each in UTF-8
     payload_file, _ = _run_builder(
         workflow, monkeypatch, tmp_path,
         changelog_present=True, changelog_body=oversized,
@@ -676,6 +773,48 @@ def test_changelog_file_path_is_shared_between_steps(workflow):
         f"mapping of {workflow}"
     )
     assert fetch_env["CHANGELOG_FILE"] == dispatch_env["CHANGELOG_FILE"]
+
+
+# ---------------------------------------------------------------------------
+# Step ordering -- "fetch before dispatch" (both workflows) and "fetch after
+# the release exists" (release.yml only, since dispatch.yml never creates a
+# release -- it re-dispatches an already-existing tag).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("workflow", BOTH_WORKFLOWS, ids=WORKFLOW_IDS)
+def test_changelog_is_fetched_before_dispatch(workflow):
+    job_name = JOB_NAME[workflow]
+    fetch_index = _step_index(workflow, job_name, FETCH_STEP_NAME)
+    dispatch_index = _step_index(workflow, job_name, DISPATCH_STEP_NAME)
+    assert fetch_index < dispatch_index, (
+        f"expected {FETCH_STEP_NAME!r} (index {fetch_index}) to precede "
+        f"{DISPATCH_STEP_NAME!r} (index {dispatch_index}) in job {job_name!r} "
+        f"of {workflow}"
+    )
+
+
+def test_release_workflow_fetches_changelog_after_release_is_created():
+    job_name = JOB_NAME[RELEASE_YML]
+    release_index = _step_index(RELEASE_YML, job_name, RELEASE_CREATE_STEP_NAME)
+    fetch_index = _step_index(RELEASE_YML, job_name, FETCH_STEP_NAME)
+    assert release_index < fetch_index, (
+        f"expected {RELEASE_CREATE_STEP_NAME!r} (index {release_index}) to "
+        f"precede {FETCH_STEP_NAME!r} (index {fetch_index}) in job "
+        f"{job_name!r} of {RELEASE_YML} -- the changelog must be fetched "
+        "from the release that was just created, not before it exists"
+    )
+
+    # dispatch.yml is the manual re-dispatch workflow for an already-existing
+    # tag -- it never creates a release, so this ordering contract has no
+    # referent there.
+    dispatch_job = _load_workflow(DISPATCH_YML)["jobs"][JOB_NAME[DISPATCH_YML]]
+    step_names = {step.get("name") for step in dispatch_job["steps"]}
+    assert RELEASE_CREATE_STEP_NAME not in step_names, (
+        f"{DISPATCH_YML} unexpectedly contains a {RELEASE_CREATE_STEP_NAME!r} "
+        "step -- this ordering contract is documented as release.yml-only "
+        "because dispatch.yml re-dispatches an existing tag rather than "
+        "creating a release; if that changed, this test needs revisiting"
+    )
 
 
 # ---------------------------------------------------------------------------
