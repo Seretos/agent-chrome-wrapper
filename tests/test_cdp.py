@@ -289,6 +289,39 @@ class TestCDPSessionTimeout:
 
         assert "DOM.getDocument" in str(exc_info.value)
 
+    def test_send_per_call_timeout_overrides_session_default(self):
+        """A per-call timeout= kwarg overrides the session's default timeout.
+
+        Session is built with a long default (30s); send() is called with a
+        short override (0.05s) against a WS that never replies.  If the
+        override were ignored (falling back to the 30s session default) this
+        test would hang for ~30s instead of failing fast — the elapsed-time
+        assertion pins that the override, not the default, is what's honoured.
+        The TimeoutError message must also name the overridden value.
+        """
+        import time
+
+        session = CDPSession(port=9222, timeout=30.0)
+        mock_ws = mock.MagicMock()
+        session._ws = mock_ws
+        session._connected_event.set()
+
+        start = time.monotonic()
+        with pytest.raises(TimeoutError) as exc_info:
+            session.send("Target.getTargetInfo", {}, timeout=0.05)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            "per-call timeout override was not honoured — send() appears to "
+            "have fallen back to the 30s session default instead of 0.05s"
+        )
+        message = str(exc_info.value)
+        assert "0.05" in message
+        assert "30.0" not in message, (
+            "TimeoutError message should report the overridden timeout "
+            "(0.05), not the session default (30.0)"
+        )
+
 
 # ── TestCDPSessionListeners ───────────────────────────────────────────────────
 

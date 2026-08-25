@@ -19,7 +19,7 @@ from fastmcp import FastMCP
 from fastmcp.tools import Tool
 from fastmcp.utilities.types import Image
 
-from chrome_wrapper_plugin.cdp import CDPSession
+from chrome_wrapper_plugin.cdp import CDPError, CDPSession
 from chrome_wrapper_plugin.chrome_process import (
     find_free_port,
     launch_chrome,
@@ -38,6 +38,14 @@ from chrome_wrapper_plugin.state import (
     resolve_session_id,
     save_state,
 )
+
+logger = logging.getLogger(__name__)
+
+# Short timeout for the get_instance_info() liveness probe — this is a
+# cheap round-trip check, not a real CDP call, so it should fail fast
+# rather than wait for the session's normal (30s) default.
+_CDP_PROBE_TIMEOUT = 2.0
+
 
 @asynccontextmanager
 async def _lifespan(server):  # noqa: ARG001
@@ -621,6 +629,32 @@ def cdp(method: str, params: dict) -> dict:
     return engine.session.send(method, params)
 
 
+def _probe_cdp_alive(engine: ChromeEngine) -> bool:
+    """Cheaply check whether this session's Chrome is still reachable over CDP.
+
+    Sends a short-timeout ``Target.getTargetInfo`` round-trip. Any reply
+    (including a CDP-level error, which still proves Chrome answered) counts
+    as alive; any other exception (timeout, connection error, malformed
+    frame, ``send()`` called before ``connect()``, etc.) counts as dead.
+    Never raises — this is validate-only and must not disrupt the rest of
+    ``get_instance_info()``.
+    """
+    # Defensive-only: unreachable via _get_engine()'s real contract, which
+    # always returns an engine with a connected session or raises before
+    # returning, so `session` is never None for a live Chrome. This branch
+    # only fires in tests via a fake engine constructed with session=None.
+    if engine.session is None:
+        return False
+    try:
+        engine.session.send("Target.getTargetInfo", {}, timeout=_CDP_PROBE_TIMEOUT)
+    except CDPError:
+        return True
+    except Exception as exc:  # noqa: BLE001 - liveness probe must never raise
+        logger.debug("cdp_alive probe failed: %s", exc)
+        return False
+    return True
+
+
 def get_instance_info() -> dict:
     """Return information about the current Chrome instance for this session.
 
@@ -643,7 +677,28 @@ def get_instance_info() -> dict:
         None on non-Windows or when the window is not yet visible.
     window_title : str | None
         Title of the Chrome browser-frame window, or None when hwnd is None.
+    cdp_alive : bool
+        Whether this session's Chrome is actually reachable over CDP right
+        now, per a short-timeout ``Target.getTargetInfo`` probe. Validate-only
+        — a False value does not trigger relaunch or any state mutation.
+        Note the lazy-launch above: if no Chrome was running for this
+        session, the ``_get_engine()`` call below starts a fresh one before
+        the probe ever runs, so ``cdp_alive: True`` in that case reports the
+        newly-launched instance is reachable — it is not a promise that this
+        is the *same* Chrome instance a caller had before (e.g. after a
+        hand-close/crash with no cached engine in this process). This tool
+        does not detect or preserve continuity with a previous instance.
     """
+    # _get_engine() may itself perform a lazy Chrome launch here if none is
+    # currently running for this session (pre-existing, documented behavior;
+    # see AGENTS.md's architecture section — "Chrome is launched lazily on
+    # the first tool that needs the browser"). That relaunch contract is out
+    # of scope for this validate-only ticket and is intentionally left
+    # unchanged. When it fires, the probe below correctly reports
+    # cdp_alive: True for the newly-launched instance, since it genuinely is
+    # reachable — this function makes no attempt to detect or preserve
+    # continuity with whatever Chrome instance (if any) existed before this
+    # call.
     engine = _get_engine()
     pid = engine.proc.pid if engine.proc is not None else None
 
@@ -656,6 +711,8 @@ def get_instance_info() -> dict:
         find_chrome_hwnd(lookup_pid) if lookup_pid is not None else (None, None)
     )
 
+    cdp_alive = _probe_cdp_alive(engine)
+
     return {
         "session_id": engine.session_id,
         "pid": pid,
@@ -664,6 +721,7 @@ def get_instance_info() -> dict:
         "profile": profile,
         "hwnd": hwnd,
         "window_title": window_title,
+        "cdp_alive": cdp_alive,
     }
 
 
